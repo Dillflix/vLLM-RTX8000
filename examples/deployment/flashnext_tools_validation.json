@@ -1,0 +1,155 @@
+{
+  "date_utc": "2026-11-11",
+  "hardware": "4x Quadro RTX8000 at 200 W",
+  "topology": "TP2/PP2",
+  "mtp_tokens": 3,
+  "enable_auto_tool_choice": true,
+  "tool_call_parser": "qwen3_coder",
+  "reasoning_parser": "qwen3",
+  "checkpoint_tokenizer_parser_check": "passed",
+  "existing_parser_tests": "159 passed",
+  "before_fix": {
+    "reproduced": true,
+    "status": 400,
+    "error": "{\"error\":{\"message\":\"\\\"auto\\\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}}"
+  },
+  "live_api": {
+    "passed": true,
+    "results": [
+      {
+        "name": "auto_thinking_False_stream_False",
+        "passed": true,
+        "finish_reason": "tool_calls",
+        "cities": [
+          "Paris"
+        ],
+        "reasoning_present": false,
+        "seconds": 0.6856680130003951
+      },
+      {
+        "name": "auto_thinking_False_stream_True",
+        "passed": true,
+        "finish_reason": "tool_calls",
+        "cities": [
+          "Paris"
+        ],
+        "reasoning_present": false,
+        "seconds": 0.6758478310075589
+      },
+      {
+        "name": "auto_thinking_True_stream_False",
+        "passed": true,
+        "finish_reason": "tool_calls",
+        "cities": [
+          "Paris"
+        ],
+        "reasoning_present": true,
+        "seconds": 1.0691012739989674
+      },
+      {
+        "name": "auto_thinking_True_stream_True",
+        "passed": true,
+        "finish_reason": "tool_calls",
+        "cities": [
+          "Paris"
+        ],
+        "reasoning_present": true,
+        "seconds": 1.0409876839985372
+      },
+      {
+        "name": "required_tool",
+        "passed": true,
+        "finish_reason": "tool_calls",
+        "cities": [
+          "Paris"
+        ],
+        "reasoning_present": false,
+        "seconds": 0.62470671099436
+      },
+      {
+        "name": "named_tool",
+        "passed": true,
+        "finish_reason": "stop",
+        "cities": [
+          "Paris"
+        ],
+        "reasoning_present": false,
+        "seconds": 0.6252064810105367
+      },
+      {
+        "name": "parallel_tool_calls",
+        "passed": true,
+        "finish_reason": "tool_calls",
+        "cities": [
+          "Paris",
+          "Tokyo"
+        ],
+        "reasoning_present": false,
+        "seconds": 0.9023667949950323
+      },
+      {
+        "name": "reasoning_False_stream_False",
+        "passed": true,
+        "content": "42",
+        "reasoning_characters": 0,
+        "finish_reason": "stop",
+        "seconds": 0.3541859319957439
+      },
+      {
+        "name": "reasoning_False_stream_True",
+        "passed": true,
+        "content": "42",
+        "reasoning_characters": 0,
+        "finish_reason": "stop",
+        "seconds": 0.35634536600264255
+      },
+      {
+        "name": "reasoning_True_stream_False",
+        "passed": true,
+        "content": "\n\n42",
+        "reasoning_characters": 90,
+        "finish_reason": "stop",
+        "seconds": 0.6486006489867577
+      },
+      {
+        "name": "reasoning_True_stream_True",
+        "passed": true,
+        "content": "\n\n42",
+        "reasoning_characters": 90,
+        "finish_reason": "stop",
+        "seconds": 0.6484293750108918
+      },
+      {
+        "name": "default_thinking_without_template_kwargs",
+        "passed": true,
+        "content": "\n\n42",
+        "reasoning_characters": 99,
+        "finish_reason": "stop",
+        "seconds": 0.6828142879967345
+      },
+      {
+        "name": "tool_result_round_trip",
+        "passed": true,
+        "content": "\n\nHere's the current weather in Paris:\n\n- **Temperature:** 17°C\n- **Condition:** Rainy 🌧️",
+        "finish_reason": "stop",
+        "seconds": 1.588479100013501
+      },
+      {
+        "name": "tool_choice_none",
+        "passed": true,
+        "content": "42",
+        "finish_reason": "stop",
+        "seconds": 0.3436887139978353
+      },
+      {
+        "name": "vision_with_reasoning",
+        "passed": true,
+        "content": "\n\nRed",
+        "reasoning_present": true,
+        "finish_reason": "stop",
+        "seconds": 0.9401441379886819
+      }
+    ]
+  },
+  "named_tool_note": "Upstream resolve_finish_reason deliberately preserves stop for a forced named tool; the structured tool call and arguments were validated."
+}

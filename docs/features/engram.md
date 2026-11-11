@@ -1261,6 +1261,35 @@ or `video_url` content parts, including base64 data URLs. The model name remains
 `Qwen3.8-Flash-Next-W8A16`. The protected server-side environment file is
 `/home/jdillman/.config/flashnext/service.env`; API keys must never be committed.
 
+The LAN launcher enables automatic tool choice with `--enable-auto-tool-choice`
+and `--tool-call-parser qwen3_coder`, matching the checkpoint template's
+`<tool_call><function=...><parameter=...>` format. It also sets
+`--reasoning-parser qwen3` to separate `<think>` output from the final answer.
+Tool definitions belong in the request's `tools` array; the server returns
+structured `tool_calls` for the client to execute. Clients submit results as
+`role: "tool"` messages carrying the matching `tool_call_id`.
+
+Thinking is controlled per request by `chat_template_kwargs.enable_thinking`.
+The checkpoint defaults to thinking enabled; setting it to `false` selects
+non-thinking generation. Its template supports reasoning efforts `low`,
+`medium`, and `xhigh` (the default). This vLLM revision returns extracted
+reasoning in `message.reasoning` or streaming `delta.reasoning`, separately from
+`content`. A proxy model alias ending in `-think` does not itself select a parser
+or set the request's thinking option.
+
+The parser-enabled LAN service passed 159 existing Qwen parser regression tests
+and 15 live API checks on November 11, 2026. Live coverage includes automatic
+tool choice with thinking on/off and streaming on/off, required and named
+choices, parallel calls, a tool-result round trip, `tool_choice: "none"`,
+reasoning separation, default thinking behavior, and vision with reasoning.
+The previously reproduced HTTP 400 for automatic tool choice is resolved.
+Results are in `examples/deployment/flashnext_tools_validation.json`.
+For forced named tools, this upstream revision deliberately returns
+`finish_reason: "stop"` alongside populated `tool_calls`; clients must inspect
+the returned calls rather than requiring `"tool_calls"` as the finish reason
+for that request mode. Automatic and required choices return `"tool_calls"`
+when calls are generated.
+
 The published branch descends directly from upstream vLLM commit
 `499a3d1e1e338e3e866c0719cfe1f429e2b0b762` plus the RTX8000 implementation.
 

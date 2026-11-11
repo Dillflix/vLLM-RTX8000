@@ -13,4 +13,6 @@ cd "$root/source"
 exec bash "$root/deployment/serve_flashnext_rtx8000.sh" \
   "$root/models/Qwen3.8-Flash-Next-experts-W8A16-channel" \
   --served-model-name Qwen3.8-Flash-Next-W8A16 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true}'
