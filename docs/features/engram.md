@@ -1233,6 +1233,51 @@ draft-head FP8 compute path does not run natively on SM75. Prefix checkpoint
 retention uses the upstream semantic-checkpoint default; periodic retention and
 fine-grained shared-prefix checkpoints have not been tuned here.
 
+## RTX8000 multimodal LAN profile
+
+`examples/deployment/start_flashnext_lan.sh` enables image and video input with
+`ENABLE_VISION=1`. Install both that script (as `start_flashnext.sh`) and
+`serve_flashnext_rtx8000.sh` in the deployment directory referenced by the
+systemd service. Keeping the launch configuration outside the frozen source
+tree permits configuration updates without modifying the tested native libraries.
+The general-purpose launcher retains text-only mode unless `ENABLE_VISION=1`
+is set.
+
+The profile keeps TP2/PP2, per-channel W8A16 experts, CPU-offloaded ngram tables,
+MTP3 with local draft argmax, prefix caching, and decode CUDA graphs. Vision
+uses the retained FP16 encoder with `TORCH_SDPA` attention on SM75. No change
+to GPU power limits is made by either launcher.
+
+The initial media budgets are four images and one video per request. Images
+are resized within a 1,048,576-pixel budget; video decoding samples 16 frames
+and its processor uses a 262,144-pixel budget. These are explicit deployment
+settings rather than the checkpoint's unrestricted defaults. The width and
+height values in `--limit-mm-per-prompt` configure memory profiling; preprocessing
+limits are supplied separately through `--mm-processor-kwargs`. Audio is not
+supported by this checkpoint.
+
+Clients use OpenAI-compatible `/v1/chat/completions` messages with `image_url`
+or `video_url` content parts, including base64 data URLs. The model name remains
+`Qwen3.8-Flash-Next-W8A16`. The protected server-side environment file is
+`/home/jdillman/.config/flashnext/service.env`; API keys must never be committed.
+
+The published branch descends directly from upstream vLLM commit
+`499a3d1e1e338e3e866c0719cfe1f429e2b0b762` plus the RTX8000 implementation.
+
+On November 11, 2026, the profile passed 18 functional checks on four RTX8000s
+at 200 W: single-image color recognition, OCR, ordered four-image input across
+chunked prefill, image changes with identical text, a repeated image prefix,
+five concurrent image requests, a short video color transition, text regression,
+five concurrent four-image requests, and rejection of a fifth image. The repeated
+1,860-token image prompt reused 1,600 cached tokens. All requests used MTP3 and
+the configured native language-model kernels. Results are recorded in
+`examples/deployment/flashnext_multimodal_validation.json`.
+
+These synthetic tests establish functional integration, not broad visual
+accuracy or optimal vision throughput. The prior text-only performance results
+remain text-only measurements; multimodal long-context saturation and video
+quality at the configured sampling budget have not been comprehensively evaluated.
+
 ## Data-parallel topologies (DeepSeek V4.1)
 
 By default (`embedding_across_dp: false`), each DP replica keeps its own

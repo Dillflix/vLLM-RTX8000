@@ -33,6 +33,19 @@ case ${ENABLE_PREFIX_CACHING:-1} in
   *) echo "ENABLE_PREFIX_CACHING must be 0 or 1." >&2; exit 2 ;;
 esac
 
+case ${ENABLE_VISION:-0} in
+  1)
+    multimodal_flags=(
+      --mm-encoder-attn-backend TORCH_SDPA
+      --limit-mm-per-prompt '{"image":{"count":4,"width":1024,"height":1024},"video":{"count":1,"num_frames":16,"width":512,"height":512}}'
+      --media-io-kwargs '{"video":{"num_frames":16}}'
+      --mm-processor-kwargs '{"images_kwargs":{"size":{"shortest_edge":65536,"longest_edge":1048576}},"videos_kwargs":{"num_frames":16,"size":{"shortest_edge":4096,"longest_edge":262144}}}'
+    )
+    ;;
+  0) multimodal_flags=(--language-model-only) ;;
+  *) echo "ENABLE_VISION must be 0 or 1." >&2; exit 2 ;;
+esac
+
 exec vllm serve "$model" \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-18381}" \
   --served-model-name Qwen3.8-Flash-Next-FP8 \
@@ -44,7 +57,7 @@ exec vllm serve "$model" \
   --kernel-config '{"moe_backend":"marlin","linear_backend":"marlin"}' \
   --attention-config '{"indexer_kv_dtype":"fp16"}' \
   --engram-config '{"cpu_offload":true,"disk_offload":false}' \
-  --language-model-only --generation-config vllm \
+  "${multimodal_flags[@]}" --generation-config vllm \
   --max-model-len "${MAX_MODEL_LEN:-8192}" \
   --max-num-seqs "${MAX_NUM_SEQS:-5}" \
   --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-2048}" \

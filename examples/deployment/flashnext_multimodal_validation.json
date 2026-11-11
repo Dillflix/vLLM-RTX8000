@@ -1,0 +1,321 @@
+{
+  "date_utc": "2026-11-11",
+  "hardware": "4x Quadro RTX8000 at 200 W",
+  "topology": "TP2/PP2, NVLink pairs 0/1 and 2/3",
+  "checkpoint": "Qwen3.8-Flash-Next-experts-W8A16-channel",
+  "mtp_tokens": 3,
+  "local_draft_argmax": true,
+  "prefix_caching": true,
+  "vision_attention": "TORCH_SDPA",
+  "validation": {
+    "passed": true,
+    "results": [
+      {
+        "name": "red_image",
+        "expected": [
+          "red"
+        ],
+        "status": 200,
+        "ttft_seconds": 0.7827629370003706,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 1860,
+          "total_tokens": 1862,
+          "completion_tokens": 2
+        },
+        "answer": " red",
+        "passed": true,
+        "elapsed_seconds": 0.8161450480110943
+      },
+      {
+        "name": "blue_image_same_text",
+        "expected": [
+          "blue"
+        ],
+        "status": 200,
+        "ttft_seconds": 0.7324413519963855,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 1860,
+          "total_tokens": 1862,
+          "completion_tokens": 2
+        },
+        "answer": "Blue",
+        "passed": true,
+        "elapsed_seconds": 0.765793312995811
+      },
+      {
+        "name": "red_image_repeated_prefix",
+        "expected": [
+          "red"
+        ],
+        "status": 200,
+        "ttft_seconds": 0.3310071020096075,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 1860,
+          "total_tokens": 1862,
+          "completion_tokens": 2
+        },
+        "answer": " red",
+        "passed": true,
+        "elapsed_seconds": 0.37025400600396097,
+        "cached_tokens_verified": 1600.0
+      },
+      {
+        "name": "ocr",
+        "expected": [
+          "TURING",
+          "8000"
+        ],
+        "status": 200,
+        "ttft_seconds": 0.4877557689906098,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 1047,
+          "total_tokens": 1055,
+          "completion_tokens": 8
+        },
+        "answer": "TURING 8000",
+        "passed": true,
+        "elapsed_seconds": 0.5550409970019246
+      },
+      {
+        "name": "four_images_chunked_prefill",
+        "expected": [
+          "red",
+          "blue",
+          "green",
+          "yellow"
+        ],
+        "status": 200,
+        "ttft_seconds": 0.5141377990075853,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 4137,
+          "total_tokens": 4308,
+          "completion_tokens": 171
+        },
+        "answer": "Based on the visual information from the four images provided, here is a breakdown of the dominant color in each one.\n\n- **Image 1:** This image is filled with a single, solid color. The color is a bright and saturated red.\n- **Image 2:** This image also consists of one uniform color, which is a vivid and intense blue.\n- **Image 3:** The third image displays a single, flat color. This color is a very bright, almost neon, green.\n- **Image 4:** The final image is composed of one solid color, which is a bright and luminous yellow.\n\n---\n\nThe dominant colors of the images in order are:\n- Image 1: Red\n- Image 2: Blue\n- Image 3: Green\n- Image 4: Yellow",
+        "passed": true,
+        "elapsed_seconds": 2.1467053390078945
+      },
+      {
+        "name": "concurrent_0",
+        "expected": [
+          "red"
+        ],
+        "status": 200,
+        "ttft_seconds": 0.4212327900022501,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 1092,
+          "total_tokens": 1094,
+          "completion_tokens": 2
+        },
+        "answer": " red",
+        "passed": true,
+        "elapsed_seconds": 0.460071034001885
+      },
+      {
+        "name": "concurrent_1",
+        "expected": [
+          "blue"
+        ],
+        "status": 200,
+        "ttft_seconds": 0.8217497760051629,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 1092,
+          "total_tokens": 1094,
+          "completion_tokens": 2
+        },
+        "answer": " blue",
+        "passed": true,
+        "elapsed_seconds": 1.4288125629973365
+      },
+      {
+        "name": "concurrent_2",
+        "expected": [
+          "yellow"
+        ],
+        "status": 200,
+        "ttft_seconds": 1.1695336749980925,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 1092,
+          "total_tokens": 1094,
+          "completion_tokens": 2
+        },
+        "answer": " yellow",
+        "passed": true,
+        "elapsed_seconds": 1.6664224409905728
+      },
+      {
+        "name": "concurrent_3",
+        "expected": [
+          "purple"
+        ],
+        "status": 200,
+        "ttft_seconds": 1.407478787994478,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 1092,
+          "total_tokens": 1094,
+          "completion_tokens": 2
+        },
+        "answer": " Purple",
+        "passed": true,
+        "elapsed_seconds": 1.684825546995853
+      },
+      {
+        "name": "concurrent_4",
+        "expected": [
+          "orange"
+        ],
+        "status": 200,
+        "ttft_seconds": 1.6452642389922403,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 1092,
+          "total_tokens": 1094,
+          "completion_tokens": 2
+        },
+        "answer": "Orange",
+        "passed": true,
+        "elapsed_seconds": 1.694295017994591
+      },
+      {
+        "name": "video_color_transition",
+        "expected": [
+          "red",
+          "blue"
+        ],
+        "status": 200,
+        "ttft_seconds": 0.3905123490112601,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 166,
+          "total_tokens": 170,
+          "completion_tokens": 4
+        },
+        "answer": "red, blue",
+        "passed": true,
+        "elapsed_seconds": 0.45974773800116964
+      },
+      {
+        "name": "text_regression",
+        "expected": [
+          "42"
+        ],
+        "status": 200,
+        "ttft_seconds": 0.3364462299941806,
+        "stream_done": true,
+        "usage": {
+          "prompt_tokens": 27,
+          "total_tokens": 30,
+          "completion_tokens": 3
+        },
+        "answer": "42",
+        "passed": true,
+        "elapsed_seconds": 0.37671896199753974
+      }
+    ]
+  },
+  "boundaries": {
+    "passed": true,
+    "results": [
+      {
+        "colors": [
+          "red",
+          "blue",
+          "yellow",
+          "purple"
+        ],
+        "status": 200,
+        "answer": "red, blue, yellow, purple",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 4134,
+          "total_tokens": 4142,
+          "completion_tokens": 8,
+          "completion_tokens_details": null
+        }
+      },
+      {
+        "colors": [
+          "orange",
+          "red",
+          "purple",
+          "blue"
+        ],
+        "status": 200,
+        "answer": "orange, red, purple, blue",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 4134,
+          "total_tokens": 4142,
+          "completion_tokens": 8,
+          "completion_tokens_details": null
+        }
+      },
+      {
+        "colors": [
+          "yellow",
+          "purple",
+          "blue",
+          "orange"
+        ],
+        "status": 200,
+        "answer": "Yellow, Purple, Blue, Orange",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 4134,
+          "total_tokens": 4142,
+          "completion_tokens": 8,
+          "completion_tokens_details": null
+        }
+      },
+      {
+        "colors": [
+          "purple",
+          "orange",
+          "red",
+          "yellow"
+        ],
+        "status": 200,
+        "answer": "purple, orange, red, yellow",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 4134,
+          "total_tokens": 4142,
+          "completion_tokens": 8,
+          "completion_tokens_details": null
+        }
+      },
+      {
+        "colors": [
+          "blue",
+          "yellow",
+          "orange",
+          "red"
+        ],
+        "status": 200,
+        "answer": "blue, yellow, orange, red",
+        "passed": true,
+        "usage": {
+          "prompt_tokens": 4134,
+          "total_tokens": 4142,
+          "completion_tokens": 8,
+          "completion_tokens_details": null
+        }
+      },
+      {
+        "status": 400,
+        "error": "{\"error\":{\"message\":\"At most 4 image(s) may be provided in one prompt. (parameter=image)\",\"type\":\"BadRequestError\",\"param\":\"image\",\"code\":400}}",
+        "passed": true
+      }
+    ]
+  },
+  "scope": "Synthetic functional checks, not broad visual quality or optimized vision throughput."
+}
