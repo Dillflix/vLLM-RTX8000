@@ -81,24 +81,26 @@ def _norm_rope(
 
 
 @triton.jit
-def _to_dst_dtype(x, dst, scale):
-    """Round to BF16 like the unfused path, then scale for an FP8 destination."""
+def _to_dst_dtype(x, dst, scale, model_dtype: tl.constexpr):
+    """Round like the unfused model path before any cache quantization."""
     out_ty = dst.dtype.element_ty
-    x = x.to(tl.bfloat16)
+    x = x.to(model_dtype)
     if out_ty == tl.float8e4nv:
         x = x.to(tl.float32) / scale
     return x.to(out_ty)
 
 
 @triton.jit
-def _store_rotated(dst, y, o1, o2, scale):
+def _store_rotated(dst, y, o1, o2, scale, model_dtype: tl.constexpr):
     """Store a normalized head whose first `2 * len(o1)` dims are rotated."""
     HALF: tl.constexpr = o1.shape[0]
     dims = tl.arange(0, y.shape[0])
     rot = tl.arange(0, HALF)
-    tl.store(dst + dims, _to_dst_dtype(y, dst, scale), mask=dims >= 2 * HALF)
-    tl.store(dst + rot, _to_dst_dtype(o1, dst, scale))
-    tl.store(dst + HALF + rot, _to_dst_dtype(o2, dst, scale))
+    tl.store(
+        dst + dims, _to_dst_dtype(y, dst, scale, model_dtype), mask=dims >= 2 * HALF
+    )
+    tl.store(dst + rot, _to_dst_dtype(o1, dst, scale, model_dtype))
+    tl.store(dst + HALF + rot, _to_dst_dtype(o2, dst, scale, model_dtype))
 
 
 @triton.jit(
@@ -201,8 +203,9 @@ def _qsa_prepare_kernel(
         x2 = tl.load(src + HALF + rot).to(tl.float32)
         w1 = tl.load(weight_ptr + rot).to(tl.float32) + 1.0
         w2 = tl.load(weight_ptr + HALF + rot).to(tl.float32) + 1.0
-        x1 = (x1 * inv_rms * w1).to(tl.bfloat16).to(tl.float32)
-        x2 = (x2 * inv_rms * w2).to(tl.bfloat16).to(tl.float32)
+        model_dtype: tl.constexpr = main_qkv_ptr.dtype.element_ty
+        x1 = (x1 * inv_rms * w1).to(model_dtype).to(tl.float32)
+        x2 = (x2 * inv_rms * w2).to(model_dtype).to(tl.float32)
         pos = tl.load(pos_ptr + token * pos_stride_token).to(tl.int64)
         if IS_2D_POSITIONS:
             pos_h = tl.load(pos_ptr + pos_stride_axis + token * pos_stride_token)
@@ -225,12 +228,15 @@ def _qsa_prepare_kernel(
                     + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
                     + kv_head * main_cache_stride_head
                 )
-                _store_rotated(dst, y, o1, o2, main_k_scale)
+                _store_rotated(dst, y, o1, o2, main_k_scale, model_dtype)
                 v = tl.load(src + MAIN_HK * MAIN_D + dims)
-                tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+                tl.store(
+                    dst + MAIN_D + dims,
+                    _to_dst_dtype(v, dst, main_v_scale, model_dtype),
+                )
         else:
             out = (token * MAIN_HQ + head) * MAIN_D
-            _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
+            _store_rotated(main_q_out_ptr + out, y, o1, o2, None, model_dtype)
             gate = tl.load(src + MAIN_D + dims)
             tl.store(main_gate_out_ptr + out + dims, gate)
         return
@@ -364,9 +370,11 @@ def _qsa_prepare_kernel(
                 mask=valid & source_valid[:, None],
                 other=0.0,
             ).to(tl.float32)
-            # Match the unfused path's BF16 pooled tensor before RMSNorm.
+            # Match the unfused path's pooled tensor before RMSNorm.
             pooled = (
-                (tl.sum(source, axis=0) / COMPRESS_RATIO).to(tl.bfloat16).to(tl.float32)
+                (tl.sum(source, axis=0) / COMPRESS_RATIO)
+                .to(k_ptr.dtype.element_ty)
+                .to(tl.float32)
             )
 
             first_position = end_position - (COMPRESS_RATIO - 1)

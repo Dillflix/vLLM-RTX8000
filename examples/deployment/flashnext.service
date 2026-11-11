@@ -1,0 +1,22 @@
+[Unit]
+Description=Flash-Next TP2 PP2 on four Quadro RTX8000 GPUs
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=1800
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=jdillman
+WorkingDirectory=/home/jdillman/work/flashnext-integration/source
+EnvironmentFile=/home/jdillman/.config/flashnext/service.env
+ExecStart=/usr/bin/bash /home/jdillman/work/flashnext-integration/deployment/start_flashnext.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=120
+KillMode=control-group
+LimitNOFILE=65536
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

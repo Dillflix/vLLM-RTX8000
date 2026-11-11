@@ -15,6 +15,7 @@ steps:
   - vllm/config/parallel.py
   - vllm/models/common/ops/sequence_parallel.py
   - vllm/models/qwen4_exp/
+  - vllm/model_executor/layers/logits_processor.py
   - vllm/model_executor/layers/vocab_parallel_embedding.py
   - vllm/model_executor/models/qwen3_next.py
   - tests/models/qwen4_exp/test_ple.py
@@ -35,6 +36,7 @@ steps:
       - vllm/config/parallel.py
       - vllm/models/common/ops/sequence_parallel.py
       - vllm/models/qwen4_exp/
+      - vllm/model_executor/layers/logits_processor.py
       - vllm/model_executor/layers/vocab_parallel_embedding.py
       - vllm/model_executor/models/qwen3_next.py
       - vllm/platforms/rocm.py

@@ -2,13 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for GPTQ."""
 
+import importlib
 import math
 from collections.abc import Callable
+from functools import cache
 
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
     MoEActivation,
@@ -55,6 +59,66 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 
+logger = init_logger(__name__)
+
+
+@cache
+def _load_rtx8000_marlin() -> None:
+    try:
+        companion_module = importlib.import_module("vllm._rtx8000_marlin_C")
+        if getattr(companion_module, "MARLIN_POLICY_REVISION", None) != 2:
+            raise RuntimeError("The guarded Marlin policy requires revision 2")
+        original = torch.ops._moe_C.moe_wna16_marlin_gemm.default
+        companion = torch.ops._moe_C.rtx8000_moe_wna16_marlin_gemm.default
+        if (
+            str(original._schema).split("(", 1)[1]
+            != str(companion._schema).split("(", 1)[1]
+        ):
+            raise RuntimeError("The installed Marlin operator schemas differ")
+        torch.library.register_fake(
+            "_moe_C::rtx8000_moe_wna16_marlin_gemm",
+            ops.moe_wna16_marlin_gemm_fake,
+        )
+    except (ImportError, AttributeError, RuntimeError) as exc:
+        raise RuntimeError(
+            "VLLM_RTX8000_MARLIN_TILES requires the matching installed "
+            "vllm._rtx8000_marlin_C companion extension"
+        ) from exc
+
+
+def _rtx8000_marlin_block_size(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk: int,
+    quant_type: ScalarType,
+    global_num_experts: int,
+    standard_gated_path: bool,
+) -> int | None:
+    """Select only the measured token counts and exact expert format."""
+    if not (
+        envs.VLLM_RTX8000_MARLIN_TILES
+        and hidden_states.shape[0] in (1, 1600, 2048)
+        and hidden_states.shape[1] == 2560
+        and hidden_states.dtype == torch.float16
+        and quant_type == scalar_types.uint8b128
+        and topk == 10
+        and global_num_experts == 512
+        and standard_gated_path
+        and w1.shape == (512, 160, 2560)
+        and w2.shape == (512, 20, 10240)
+        and w1.dtype == w2.dtype == torch.int32
+        and w1_scale.shape == (512, 1, 640)
+        and w2_scale.shape == (512, 1, 2560)
+        and w1_scale.dtype == w2_scale.dtype == torch.float16
+        and hidden_states.is_cuda
+        and current_platform.is_device_capability(75, hidden_states.device.index)
+    ):
+        return None
+    return 16 if hidden_states.shape[0] == 1 else 32
+
 
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -86,6 +150,7 @@ def _fused_marlin_moe(
     output: torch.Tensor | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
     mul_topk_weights_in_gemm2: bool = True,
+    rtx8000_tiles: bool = False,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
@@ -139,6 +204,7 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        rtx8000_tiles=rtx8000_tiles,
     )
     activation_input = intermediate_cache1.view(-1, w13_num_shards * N)
     if activation_func is None:
@@ -190,6 +256,7 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        rtx8000_tiles=rtx8000_tiles,
     )
 
     return output
@@ -310,6 +377,40 @@ def fused_marlin_moe(
         if M * topk / E / block_size_m < 0.9:
             break
 
+    rtx8000_block_size = _rtx8000_marlin_block_size(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk,
+        quant_type,
+        global_num_experts,
+        activation == MoEActivation.SILU
+        and (
+            activation_func is None
+            or getattr(activation_func, "__func__", None)
+            is mk.FusedMoEExpertsModular.activation
+        )
+        and expert_map is None
+        and bias1 is None
+        and bias2 is None
+        and w1_zeros is None
+        and w2_zeros is None
+        and global_scale1 is None
+        and global_scale2 is None
+        and not apply_router_weight_on_input
+        and mul_topk_weights_in_gemm2,
+    )
+    if rtx8000_block_size is not None:
+        _load_rtx8000_marlin()
+        block_size_m = rtx8000_block_size
+        logger.info_once(
+            "RTX8000 Marlin tile dispatch active: tokens=%d block_m=%d",
+            hidden_states.shape[0],
+            block_size_m,
+        )
+
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,
         block_size_m,
@@ -349,6 +450,7 @@ def fused_marlin_moe(
         intermediate_cache2=intermediate_cache2,
         output=None,
         mul_topk_weights_in_gemm2=mul_topk_weights_in_gemm2,
+        rtx8000_tiles=rtx8000_block_size is not None,
     ).view(-1, topk, K)
 
     if output is None:

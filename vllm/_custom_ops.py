@@ -2475,8 +2475,14 @@ def moe_wna16_marlin_gemm(
     thread_k: int = -1,
     thread_n: int = -1,
     blocks_per_sm: int = -1,
+    rtx8000_tiles: bool = False,
 ) -> torch.Tensor:
-    return torch.ops._moe_C.moe_wna16_marlin_gemm(
+    gemm = (
+        torch.ops._moe_C.rtx8000_moe_wna16_marlin_gemm
+        if rtx8000_tiles
+        else torch.ops._moe_C.moe_wna16_marlin_gemm
+    )
+    return gemm(
         input,
         output,
         b_qweight,
@@ -2531,6 +2537,9 @@ if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "moe_wna16_marlin_
         use_atomic_add: bool,
         use_fp32_reduce: bool,
         is_zp_float: bool,
+        thread_k: int = -1,
+        thread_n: int = -1,
+        blocks_per_sm: int = -1,
     ):
         return torch.empty(
             (size_m * top_k, size_n), dtype=input.dtype, device=input.device

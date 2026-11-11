@@ -129,13 +129,14 @@ class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
 class Qwen4ExpQSABackend(AttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     # fp8/fp8_e4m3: e4m3 bytes in a uint8 cache, written by reshape_and_cache
     # with the layer's per-tensor scales and dequantized on load inside the QSA
     # Triton kernel.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
+        "float16",
         "fp8",
         "fp8_e4m3",
     ]
@@ -184,9 +185,9 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+        if kv_cache_dtype not in ("auto", "bfloat16", "float16", "fp8", "fp8_e4m3"):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
+                "Qwen4Exp QSA requires a BF16/FP16 or FP8-e4m3 main KV cache"
             )
         self.num_heads = num_heads
         self.head_size = head_size
@@ -251,13 +252,16 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             # other host-scale backends; folded into the kernel's scales.
             k_scale = layer._k_scale_float
             v_scale = layer._v_scale_float
-        if query.dtype != torch.bfloat16 or key_cache.dtype not in (
+        if query.dtype not in (
             torch.bfloat16,
+            torch.float16,
+        ) or key_cache.dtype not in (
+            query.dtype,
             torch.float8_e4m3fn,
             torch.uint8,
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires BF16 Q and BF16 or FP8-e4m3 K/V"
+                "Qwen4Exp QSA requires BF16/FP16 Q with matching or FP8-e4m3 K/V"
             )
 
         from .ops.qsa import qsa_sparse_paged_attention
@@ -299,16 +303,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         model_config = vllm_config.model_config
         if cache_config is None:
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
-        if model_config.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
+        if model_config.dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError("Qwen4Exp QSA requires BF16 or FP16")
         if cache_config.cache_dtype not in (
             "auto",
             "bfloat16",
+            "float16",
             "fp8",
             "fp8_e4m3",
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
+                "Qwen4Exp QSA requires a BF16/FP16 or FP8-e4m3 main KV cache"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -409,9 +414,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype not in (torch.bfloat16, torch.uint8):
+        if self.kv_cache_torch_dtype not in (model_config.dtype, torch.uint8):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires BF16 or FP8-e4m3 (uint8) cache storage"
+                "Qwen4Exp QSA requires cache storage in the model dtype or uint8"
             )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])

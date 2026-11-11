@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen4Exp decode GEMM selection on Hopper and Blackwell.
+"""Qwen4Exp small-batch GEMM selection on Turing, Hopper and Blackwell.
 
-Dispatch follows Kimi-K3 and uses the local `(N, K)` shape and token count.
+Dispatch uses the local `(N, K)` shape and token count.
 Plans contain measured CUDA graph capture sizes; other token counts use the
 standard linear implementation.
 """
@@ -407,6 +407,16 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
 
 
 def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if (
+        envs.VLLM_RTX8000_NATIVE_DENSE
+        and not envs.VLLM_BATCH_INVARIANT
+        and current_platform.get_device_capability() == (7, 5)
+    ):
+        from .ops.rtx8000 import dense
+
+        result = dense(x, weight)
+        if result is not None:
+            return result
     plans = QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.get(
         current_platform.get_device_capability(), {}
     )
@@ -438,6 +448,31 @@ def enable_qwen4_exp_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
 ) -> None:
+    if (
+        envs.VLLM_RTX8000_NATIVE_DENSE
+        and dtype == torch.float16
+        and current_platform.get_device_capability() == (7, 5)
+    ):
+        from .ops.rtx8000 import DENSE_PLANS, load_native
+
+        load_native()
+        for child in module.modules():
+            is_linear = (
+                isinstance(child, LinearBase)
+                and type(child.quant_method) is UnquantizedLinearMethod
+            )
+            is_head = isinstance(child, ParallelLMHead) and type(
+                child.quant_method
+            ) in (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+            if not (is_linear or is_head):
+                continue
+            if tuple(child.weight.shape) not in DENSE_PLANS:
+                continue
+            if type(child.quant_method) is UnquantizedEmbeddingMethod:
+                child.quant_method = Qwen4ExpLowLatencyEmbeddingMethod()
+            else:
+                child.quant_method = Qwen4ExpLowLatencyLinearMethod()
+        return
     plans = QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.get(
         current_platform.get_device_capability(), {}
     )

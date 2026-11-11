@@ -22,8 +22,21 @@
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
+#ifndef MARLIN_GEMM_ENTRY_NAME
+  #define MARLIN_GEMM_ENTRY_NAME moe_wna16_marlin_gemm
+#endif
 
 #include "kernel.h"
+
+#ifdef MARLIN_RTX8000_GUARDED_SELECTOR
+namespace rtx8000_marlin_guarded {
+using GuardedMarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
+GuardedMarlinFuncPtr get_kernel(int thread_m_blocks);
+}  // namespace rtx8000_marlin_guarded
+#endif
+
+#include <cstdlib>
+#include <cstring>
 
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/library.h>
@@ -33,6 +46,16 @@
 #include <torch/headeronly/util/Exception.h>
 
 #include "torch_utils.h"
+
+#ifdef MARLIN_EXTERNAL_SELECTOR
+namespace marlin_moe_wna16 {
+using ExternalMarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
+ExternalMarlinFuncPtr get_marlin_kernel(vllm::ScalarType, vllm::ScalarType,
+                                        vllm::ScalarType, vllm::ScalarType, int,
+                                        int, int, bool, bool, int, int, bool,
+                                        int);
+}  // namespace marlin_moe_wna16
+#endif
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -44,6 +67,46 @@ namespace MARLIN_NAMESPACE_NAME {
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
+
+// Only the explicitly enabled SM75 per-channel INT8 path uses the exact
+// scratch allocation. Other formats retain the existing launch policy.
+bool use_exact_shared_mem() {
+#ifdef MARLIN_FORCE_EXACT_SHARED_MEM
+  return true;
+#else
+  const char* value = std::getenv("VLLM_MARLIN_MOE_EXACT_SHARED_MEM");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+#endif
+}
+
+int exact_shared_mem_occupancy(MarlinFuncPtr kernel, int threads,
+                               int cache_size, int device) {
+  struct Entry {
+    MarlinFuncPtr kernel;
+    int threads, cache_size, device, active_blocks;
+  };
+  // The selected kernel's registers/static shared memory and the device's
+  // reservation do not vary between launches. Avoid runtime queries in decode.
+  static thread_local std::vector<Entry> entries;
+  for (const auto& entry : entries) {
+    if (entry.kernel == kernel && entry.threads == threads &&
+        entry.cache_size == cache_size && entry.device == device) {
+      return entry.active_blocks;
+    }
+  }
+  auto status = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, cache_size);
+  STD_TORCH_CHECK(status == cudaSuccess,
+                  "Marlin dynamic shared memory setup failed: ",
+                  cudaGetErrorString(status));
+  int active_blocks = 0;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks, kernel,
+                                                         threads, cache_size);
+  STD_TORCH_CHECK(status == cudaSuccess, "Marlin occupancy query failed: ",
+                  cudaGetErrorString(status));
+  entries.push_back({kernel, threads, cache_size, device, active_blocks});
+  return active_blocks;
+}
 
 typedef struct {
   int thread_k;
@@ -173,7 +236,27 @@ MarlinFuncPtr get_marlin_kernel(const vllm::ScalarType a_type,
   int num_bits = b_type.size_bits();
   auto kernel = MarlinDefault;
 
-#include "kernel_selector.h"
+#ifdef MARLIN_RTX8000_GUARDED_SELECTOR
+  if (a_type == vllm::kFloat16 && b_type == vllm::kU8B128 &&
+      c_type == vllm::kFloat16 && s_type == vllm::kFloat16 &&
+      thread_n_blocks == 8 && thread_k_blocks == 4 && !m_block_size_8 &&
+      !has_zp && group_blocks == -1 && threads == 128 && !is_zp_float &&
+      stages == 2) {
+    const auto selected = rtx8000_marlin_guarded::get_kernel(thread_m_blocks);
+    if (selected != nullptr) kernel = selected;
+  }
+#elif defined(MARLIN_EXTERNAL_SELECTOR)
+  const auto selected = marlin_moe_wna16::get_marlin_kernel(
+      a_type, b_type, c_type, s_type, thread_m_blocks, thread_n_blocks,
+      thread_k_blocks, m_block_size_8, has_zp, group_blocks, threads,
+      is_zp_float, stages);
+  const auto unsupported = marlin_moe_wna16::get_marlin_kernel(
+      a_type, b_type, c_type, s_type, 0, 0, 0, false, false, -1, 0, false,
+      stages);
+  kernel = selected == unsupported ? MarlinDefault : selected;
+#else
+  #include "kernel_selector.h"
+#endif
 
   return kernel;
 }
@@ -183,7 +266,8 @@ exec_config_t determine_exec_config(
     const vllm::ScalarType& c_type, const vllm::ScalarType& s_type, int prob_m,
     int prob_n, int prob_k, int num_experts, int top_k, int thread_m_blocks,
     bool m_block_size_8, int num_bits, int group_size, bool has_zp,
-    bool is_zp_float, int stages, int max_shared_mem, int sms) {
+    bool is_zp_float, int stages, int max_shared_mem, int sms,
+    bool exact_shared_mem, int device) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1
                                         ? large_batch_thread_configs
@@ -217,11 +301,20 @@ exec_config_t determine_exec_config(
 
     if (kernel == MarlinDefault) continue;
 
-    cudaFuncAttributes attr;
-    cudaFuncGetAttributes(&attr, kernel);
-    int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
-    int allow_count = min(device_max_reg_size / reg_size,
-                          max_shared_mem / (cache_size + 1536));
+    // The CUDA query includes register allocation granularity, static shared
+    // memory and the device's reserved shared memory per block.
+    int allow_count;
+    if (exact_shared_mem) {
+      allow_count = exact_shared_mem_occupancy(kernel, th_config.num_threads,
+                                               cache_size, device);
+    } else {
+      cudaFuncAttributes attr;
+      cudaFuncGetAttributes(&attr, kernel);
+      int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
+      allow_count = min(device_max_reg_size / reg_size,
+                        max_shared_mem / (cache_size + 1536));
+    }
+    if (exact_shared_mem && allow_count == 0) continue;
     if (thread_m_blocks == 1)
       allow_count = max(min(allow_count, 4), 1);
     else
@@ -302,6 +395,29 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                     "Turing only support FP16 activation.");
   }
 
+  const bool exact_shared_mem =
+      use_exact_shared_mem() && major_capability == 7 &&
+      minor_capability == 5 && a_type == vllm::kFloat16 &&
+      c_type == vllm::kFloat16 && s_type == vllm::kFloat16 &&
+      b_type == vllm::kU8B128 && group_size == -1 && !has_zp;
+
+#ifdef MARLIN_COMPANION_REGISTRATION
+  const bool measured_gate =
+      top_k == 10 && prob_n == 640 && prob_k == 2560 && !mul_topk_weights &&
+      ((prob_m == 1 && moe_block_size == 16) ||
+       ((prob_m == 1600 || prob_m == 2048) && moe_block_size == 32));
+  const bool measured_down =
+      top_k == 1 && prob_n == 2560 && prob_k == 320 && mul_topk_weights &&
+      ((prob_m == 10 && moe_block_size == 16) ||
+       ((prob_m == 16000 || prob_m == 20480) && moe_block_size == 32));
+  STD_TORCH_CHECK(
+      exact_shared_mem && num_experts == 512 && !has_bias && !use_atomic_add &&
+          use_fp32_reduce && !is_zp_float && thread_k == -1 && thread_n == -1 &&
+          blocks_per_sm == -1 && (measured_gate || measured_down),
+      "RTX8000 Marlin dispatch only supports the qualified M1/M1600/M2048 "
+      "SM75 FP16 per-channel INT8 expert geometry");
+#endif
+
   // Set thread config
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
@@ -318,7 +434,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     exec_cfg = determine_exec_config(
         a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
         top_k, thread_m_blocks, m_block_size_8, num_bits, group_size, has_zp,
-        is_zp_float, stages, max_shared_mem, sms);
+        is_zp_float, stages, max_shared_mem, sms, exact_shared_mem, dev);
     thread_tfg = exec_cfg.tb_cfg;
   }
 
@@ -326,7 +442,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
-  if (exec_cfg.blocks_per_sm > 1)
+  // C_tmp and lock workspaces are sized for at most four CTAs per SM.
+  if (exact_shared_mem) {
+    STD_TORCH_CHECK(exec_cfg.blocks_per_sm >= 1 && exec_cfg.blocks_per_sm <= 4,
+                    "Exact-scratch Marlin requires 1 <= blocks_per_sm <= 4");
+  }
+  if (!exact_shared_mem && exec_cfg.blocks_per_sm > 1)
     max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
   int thread_k_blocks = thread_k / 16;
@@ -348,6 +469,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       thread_tfg, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
       num_bits, group_size, has_zp, is_zp_float, stages);
 
+  // get_kernel_cache_size mirrors sh_new, the overlaid B/reduction/bias
+  // storage, then zero-points/scales/A in marlin_template.h. For M8 it rounds
+  // metadata up to M16, retaining a conservative allocation bound.
+  if (exact_shared_mem) max_shared_mem = sh_cache_size;
+
   auto kernel =
       get_marlin_kernel(a_type, b_type, c_type, s_type, thread_m_blocks,
                         thread_n_blocks, thread_k_blocks, m_block_size_8,
@@ -362,8 +488,19 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                     ", num_bits = ", num_bits);
   }
 
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       max_shared_mem);
+  if (exact_shared_mem) {
+    int active_blocks =
+        exact_shared_mem_occupancy(kernel, num_threads, max_shared_mem, dev);
+    STD_TORCH_CHECK(exec_cfg.blocks_per_sm <= active_blocks,
+                    "Requested Marlin blocks_per_sm = ", exec_cfg.blocks_per_sm,
+                    " exceeds CUDA occupancy = ", active_blocks,
+                    " with dynamic shared memory = ", max_shared_mem);
+  }
+
+  if (!exact_shared_mem) {
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         max_shared_mem);
+  }
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
@@ -376,7 +513,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
 }  // namespace MARLIN_NAMESPACE_NAME
 
-torch::stable::Tensor moe_wna16_marlin_gemm(
+torch::stable::Tensor MARLIN_GEMM_ENTRY_NAME(
     torch::stable::Tensor& a, std::optional<torch::stable::Tensor> c_or_none,
     torch::stable::Tensor& b_q_weight,
     std::optional<torch::stable::Tensor> const& b_bias_or_none,
@@ -391,6 +528,36 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     int64_t size_n, int64_t size_k, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float, int64_t thread_k, int64_t thread_n,
     int64_t blocks_per_sm) {
+#ifdef MARLIN_COMPANION_REGISTRATION
+  using torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(a.device().is_cuda() && a.scalar_type() == ScalarType::Half &&
+                      a.dim() == 2 && a.is_contiguous(),
+                  "RTX8000 Marlin requires contiguous FP16 CUDA activations");
+  const auto check_tensor = [&](const torch::stable::Tensor& tensor,
+                                ScalarType dtype, int rank, const char* name) {
+    STD_TORCH_CHECK(tensor.device() == a.device() && tensor.is_contiguous() &&
+                        tensor.scalar_type() == dtype && tensor.dim() == rank,
+                    "RTX8000 Marlin invalid tensor dtype/rank/device: ", name);
+  };
+  check_tensor(b_q_weight, ScalarType::Int, 3, "packed weights");
+  check_tensor(b_scales, ScalarType::Half, 3, "scales");
+  check_tensor(workspace, ScalarType::Int, 1, "workspace");
+  check_tensor(sorted_token_ids, ScalarType::Int, 1, "sorted token IDs");
+  check_tensor(expert_ids, ScalarType::Int, 1, "expert IDs");
+  check_tensor(num_tokens_past_padded, ScalarType::Int, 1,
+               "padded token count");
+  check_tensor(topk_weights, ScalarType::Float, 2, "top-k weights");
+  if (c_or_none.has_value()) {
+    check_tensor(c_or_none.value(), ScalarType::Half, 2, "output");
+  }
+  STD_TORCH_CHECK(
+      b_scales.size(0) == b_q_weight.size(0) && b_scales.size(1) == 1 &&
+          num_tokens_past_padded.numel() == 1 && topk_weights.size(1) == 10 &&
+          topk_weights.numel() == size_m * top_k &&
+          sorted_token_ids.numel() >= size_m * top_k &&
+          expert_ids.numel() * moe_block_size >= sorted_token_ids.numel(),
+      "RTX8000 Marlin invalid scale or routing shape");
+#endif
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.scalar_type();
@@ -640,6 +807,8 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
   return c;
 }
 
+#ifndef MARLIN_COMPANION_REGISTRATION
 STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("moe_wna16_marlin_gemm", TORCH_BOX(&moe_wna16_marlin_gemm));
 }
+#endif

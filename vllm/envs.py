@@ -193,6 +193,15 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+    VLLM_RTX8000_CUTLASS_PREFILL: bool = False
+    VLLM_RTX8000_NATIVE_QSA: bool = False
+    VLLM_RTX8000_NATIVE_DENSE: bool = False
+    VLLM_RTX8000_GDN_TILES: bool = False
+    VLLM_RTX8000_NATIVE_GDN: bool = False
+    VLLM_RTX8000_NATIVE_GDN_H: bool = False
+    VLLM_RTX8000_MARLIN_TILES: bool = False
+    VLLM_MARLIN_MOE_EXACT_SHARED_MEM: bool = False
+    VLLM_RTX8000_CUSTOM_AR_MAX_MIB: int = 8
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -1630,6 +1639,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
+    ),
+    "VLLM_RTX8000_NATIVE_QSA": lambda: (
+        os.environ.get("VLLM_RTX8000_NATIVE_QSA", "0") == "1"
+    ),
+    "VLLM_RTX8000_NATIVE_DENSE": lambda: (
+        os.environ.get("VLLM_RTX8000_NATIVE_DENSE", "0") == "1"
+    ),
+    "VLLM_RTX8000_GDN_TILES": lambda: (
+        os.environ.get("VLLM_RTX8000_GDN_TILES", "0") == "1"
+    ),
+    "VLLM_RTX8000_NATIVE_GDN": lambda: (
+        os.environ.get("VLLM_RTX8000_NATIVE_GDN", "0") == "1"
+    ),
+    "VLLM_RTX8000_NATIVE_GDN_H": lambda: (
+        os.environ.get("VLLM_RTX8000_NATIVE_GDN_H", "0") == "1"
+    ),
+    "VLLM_RTX8000_MARLIN_TILES": lambda: (
+        os.environ.get("VLLM_RTX8000_MARLIN_TILES", "0") == "1"
+    ),
+    "VLLM_MARLIN_MOE_EXACT_SHARED_MEM": lambda: (
+        os.environ.get("VLLM_MARLIN_MOE_EXACT_SHARED_MEM", "0") == "1"
+    ),
+    "VLLM_RTX8000_CUSTOM_AR_MAX_MIB": lambda: int(
+        os.environ.get("VLLM_RTX8000_CUSTOM_AR_MAX_MIB", "8")
+    ),
+    "VLLM_RTX8000_CUTLASS_PREFILL": lambda: (
+        os.environ.get("VLLM_RTX8000_CUTLASS_PREFILL", "0") == "1"
     ),
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(

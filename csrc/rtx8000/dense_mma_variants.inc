@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// ID, unique entry name, N tile, K tile, shared-memory half-element skew
+RTX_DENSE_MMA_VARIANT(4, n64_k64_s0, 64, 64, 0)
+RTX_DENSE_MMA_VARIANT(5, n64_k128_s0, 64, 128, 0)
+RTX_DENSE_MMA_VARIANT(6, n128_k64_s0, 128, 64, 0)
+RTX_DENSE_MMA_VARIANT(7, n128_k128_s0, 128, 128, 0)
+RTX_DENSE_MMA_VARIANT(8, n64_k128_s8, 64, 128, 8)
+RTX_DENSE_MMA_VARIANT(9, n64_k128_s16, 64, 128, 16)
+RTX_DENSE_MMA_VARIANT(10, n128_k64_s8, 128, 64, 8)
+RTX_DENSE_MMA_VARIANT(11, n128_k64_s16, 128, 64, 16)

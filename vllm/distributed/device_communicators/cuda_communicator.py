@@ -157,9 +157,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            max_size = 8 * 1024 * 1024
+            if current_platform.get_device_capability() == (7, 5):
+                max_mib = envs.VLLM_RTX8000_CUSTOM_AR_MAX_MIB
+                if not 1 <= max_mib <= 256:
+                    raise ValueError(
+                        "VLLM_RTX8000_CUSTOM_AR_MAX_MIB must be in [1, 256]"
+                    )
+                max_size = max_mib * 1024 * 1024
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
+                max_size=max_size,
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),

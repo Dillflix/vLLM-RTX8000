@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/qsa_variants.inc" RTX8000_QSA_PLANS
+  REGEX "^RTX_QSA_VARIANT")
+set(RTX8000_QSA_SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_variant_dispatch.cu")
+foreach(RTX8000_QSA_PLAN IN LISTS RTX8000_QSA_PLANS)
+  string(REGEX REPLACE "^RTX_QSA_VARIANT\\([0-9]+, *([a-z0-9_]+),.*" "\\1"
+    RTX8000_QSA_NAME "${RTX8000_QSA_PLAN}")
+  list(APPEND RTX8000_QSA_SOURCES
+    "${CMAKE_CURRENT_LIST_DIR}/qsa_${RTX8000_QSA_NAME}.cu")
+endforeach()

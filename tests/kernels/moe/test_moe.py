@@ -42,6 +42,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     int8_w8a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+    MarlinExperts,
+    _load_rtx8000_marlin,
+    _rtx8000_marlin_block_size,
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
@@ -1141,6 +1144,252 @@ def test_fused_marlin_moe(
     )
 
     torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(75), reason="RTX8000 SM75 dispatch"
+)
+@pytest.mark.parametrize(
+    "change, expected",
+    [
+        ({}, 16),
+        ({"tokens": 2048}, 32),
+        ({"tokens": 1600}, 32),
+        ({"tokens": 4}, None),
+        ({"tokens": 512}, None),
+        ({"tokens": 1024}, None),
+        ({"enabled": False}, None),
+        ({"quant_type": scalar_types.uint4b8}, None),
+        ({"scale_groups": 40}, None),
+        ({"experts": 256}, None),
+        ({"hidden": 2048}, None),
+        ({"topk": 8}, None),
+        ({"global_experts": 1024}, None),
+        ({"standard_gated_path": False}, None),
+        ({"dtype": torch.bfloat16}, None),
+    ],
+)
+def test_rtx8000_marlin_dispatch_scope(monkeypatch, change, expected):
+    """Unqualified shapes and formats must retain the existing dispatcher."""
+    config = (
+        dict(
+            tokens=1,
+            hidden=2560,
+            experts=512,
+            topk=10,
+            global_experts=512,
+            scale_groups=1,
+            quant_type=scalar_types.uint8b128,
+            dtype=torch.float16,
+            standard_gated_path=True,
+            enabled=True,
+        )
+        | change
+    )
+    monkeypatch.setenv("VLLM_RTX8000_MARLIN_TILES", str(int(config["enabled"])))
+    # Real CUDA tensors with shared storage suffice for a metadata-only policy.
+    value = torch.empty((), dtype=config["dtype"], device="cuda")
+    packed = torch.empty((), dtype=torch.int32, device="cuda")
+    e = config["experts"]
+    selected = _rtx8000_marlin_block_size(
+        value.expand(config["tokens"], config["hidden"]),
+        packed.expand(e, 160, 2560),
+        packed.expand(e, 20, 10240),
+        value.expand(e, config["scale_groups"], 640),
+        value.expand(e, config["scale_groups"], 2560),
+        config["topk"],
+        config["quant_type"],
+        config["global_experts"],
+        config["standard_gated_path"],
+    )
+    assert selected == expected
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(75), reason="RTX8000 SM75 dispatch"
+)
+@pytest.mark.parametrize("companion", [False, True])
+def test_rtx8000_marlin_fake_dispatch(companion):
+    """Both operator schemas must accept the automatic tile arguments in graphs."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    import vllm._custom_ops as ops
+
+    _load_rtx8000_marlin()
+    with FakeTensorMode():
+        x = torch.empty(1, 2560, device="cuda", dtype=torch.float16)
+        packed = torch.empty(512, 160, 2560, device="cuda", dtype=torch.int32)
+        scales = torch.empty(512, 1, 640, device="cuda", dtype=torch.float16)
+        indices = torch.empty(256, device="cuda", dtype=torch.int32)
+        weights = torch.empty(1, 10, device="cuda", dtype=torch.float32)
+        output = ops.moe_wna16_marlin_gemm(
+            x,
+            None,
+            packed,
+            None,
+            scales,
+            None,
+            None,
+            indices,
+            indices,
+            indices,
+            indices,
+            weights,
+            16,
+            10,
+            False,
+            scalar_types.uint8b128,
+            1,
+            640,
+            2560,
+            False,
+            True,
+            False,
+            rtx8000_tiles=companion,
+        )
+        assert output.shape == (10, 640)
+        assert output.dtype == torch.float16
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(75), reason="RTX8000 SM75 dispatch"
+)
+def test_rtx8000_marlin_rejects_malformed_tensors():
+    """Direct companion calls must reject tensors before reinterpret casts."""
+    _load_rtx8000_marlin()
+    a = torch.empty(1, 2560, dtype=torch.float16, device="cuda")
+    output = torch.empty(10, 640, dtype=torch.float16, device="cuda")
+    packed = torch.empty(512, 160, 2560, dtype=torch.int32, device="cuda")
+    scales = torch.empty(512, 1, 640, dtype=torch.float16, device="cuda")
+    workspace = torch.empty(288, dtype=torch.int32, device="cuda")
+    sorted_ids = torch.empty(160, dtype=torch.int32, device="cuda")
+    expert_ids = torch.empty(10, dtype=torch.int32, device="cuda")
+    padded = torch.empty(1, dtype=torch.int32, device="cuda")
+    weights = torch.empty(1, 10, dtype=torch.float32, device="cuda")
+    arguments = [
+        a,
+        output,
+        packed,
+        None,
+        scales,
+        None,
+        None,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        padded,
+        weights,
+        16,
+        10,
+        False,
+        scalar_types.uint8b128.id,
+        1,
+        640,
+        2560,
+        False,
+        True,
+        False,
+        -1,
+        -1,
+        -1,
+    ]
+    invalid = (
+        (2, packed.view(torch.float32)),
+        (4, torch.empty_like(scales, dtype=torch.float32)),
+        (1, torch.empty_like(output, dtype=torch.float32)),
+        (7, torch.empty_like(workspace, dtype=torch.int64)),
+        (8, torch.empty_like(sorted_ids, dtype=torch.int64)),
+        (11, torch.empty_like(weights, dtype=torch.float16)),
+        (4, torch.empty(scales.shape, dtype=torch.float16)),
+        (8, sorted_ids.view(10, 16)),
+    )
+    for position, replacement in invalid:
+        candidate = arguments.copy()
+        candidate[position] = replacement
+        with pytest.raises(RuntimeError, match="RTX8000 Marlin invalid tensor"):
+            torch.ops._moe_C.rtx8000_moe_wna16_marlin_gemm(*candidate)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(75), reason="RTX8000 SM75 dispatch"
+)
+@pytest.mark.usefixtures("default_vllm_config")
+def test_rtx8000_marlin_production_dispatch(monkeypatch):
+    """The modular expert entry uses guarded kernels at qualified counts."""
+    set_random_seed(17)
+    monkeypatch.setenv("VLLM_MARLIN_MOE_EXACT_SHARED_MEM", "0")
+    w1 = torch.randint(
+        -(2**31), 2**31 - 1, (512, 160, 2560), dtype=torch.int32, device="cuda"
+    )
+    w2 = torch.randint(
+        -(2**31), 2**31 - 1, (512, 20, 10240), dtype=torch.int32, device="cuda"
+    )
+    s1 = torch.full((512, 1, 640), 0.001, dtype=torch.float16, device="cuda")
+    s2 = torch.full((512, 1, 2560), 0.001, dtype=torch.float16, device="cuda")
+    experts = MarlinExperts(
+        make_dummy_moe_config(
+            num_experts=512,
+            experts_per_token=10,
+            hidden_dim=2560,
+            intermediate_size=320,
+            in_dtype=torch.float16,
+            max_num_tokens=2048,
+        ),
+        int8_w8a16_moe_quant_config(s1, s2),
+    )
+    for tokens in (1, 1600, 2048, 4, 1024):
+        x = torch.randn(tokens, 2560, device="cuda", dtype=torch.float16) * 0.05
+        scores = torch.rand(tokens, 512, device="cuda")
+        weights, ids = torch.topk(scores.softmax(-1), 10)
+        shapes = experts.workspace_shapes(
+            tokens, 320, 2560, 10, 512, 512, None, MoEActivation.SILU
+        )
+        workspace13, workspace2 = (
+            torch.empty(shape, dtype=torch.float16, device="cuda")
+            for shape in shapes[:2]
+        )
+
+        def run(
+            x=x,
+            weights=weights,
+            ids=ids,
+            workspace13=workspace13,
+            workspace2=workspace2,
+        ):
+            output = torch.empty_like(x)
+            experts.apply(
+                output=output,
+                hidden_states=x,
+                w1=w1,
+                w2=w2,
+                topk_weights=weights,
+                topk_ids=ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=512,
+                expert_map=None,
+                a1q_scale=None,
+                a2_scale=None,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=None,
+                apply_router_weight_on_input=False,
+            )
+            return output
+
+        monkeypatch.setenv("VLLM_RTX8000_MARLIN_TILES", "0")
+        reference = run()
+        monkeypatch.setenv("VLLM_RTX8000_MARLIN_TILES", "1")
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as p:
+            actual = run()
+        companion_calls = sum(
+            event.count
+            for event in p.key_averages()
+            if event.key == "_moe_C::rtx8000_moe_wna16_marlin_gemm"
+        )
+        assert companion_calls == (2 if tokens in (1, 1600, 2048) else 0)
+        torch.testing.assert_close(actual, reference, atol=4e-2, rtol=0)
 
 
 @pytest.mark.flaky(reruns=2)

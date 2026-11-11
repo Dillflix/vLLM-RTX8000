@@ -60,7 +60,9 @@ def assert_fp8_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor) -> N
     assert bool(((code_diff <= 1) | (abs_diff <= 2**-8)).all())
 
 
-def _make_main_inputs(num_tokens: int, fp8_cache: bool) -> dict:
+def _make_main_inputs(
+    num_tokens: int, fp8_cache: bool, dtype: torch.dtype = torch.bfloat16
+) -> dict:
     """Random main-attention arguments with a paged cache in vLLM's layout."""
     num_blocks = num_tokens // MAIN_PAGE + 2
     cache = torch.zeros(
@@ -68,18 +70,18 @@ def _make_main_inputs(num_tokens: int, fp8_cache: bool) -> dict:
         MAIN_HK,
         MAIN_PAGE,
         2 * MAIN_D,
-        dtype=torch.uint8 if fp8_cache else torch.bfloat16,
+        dtype=torch.uint8 if fp8_cache else dtype,
         device="cuda",
     ).transpose(1, 2)
     slots = torch.randperm(num_blocks * MAIN_PAGE, device="cuda")[:num_tokens]
     slots[-1] = -1
-    norm_weights = torch.randn(2, MAIN_D, dtype=torch.bfloat16, device="cuda") * 0.2
+    norm_weights = torch.randn(2, MAIN_D, dtype=dtype, device="cuda") * 0.2
     qkv_width = 2 * (MAIN_HQ + MAIN_HK) * MAIN_D
     return dict(
         main_qkv=torch.randn(
             num_tokens,
             qkv_width + (HQ + 1) * D,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             device="cuda",
         )[:, :qkv_width],
         main_q_norm_weight=norm_weights[0],
@@ -131,17 +133,25 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
         torch.tensor(main["main_k_scale"], device="cuda"),
         torch.tensor(main["main_v_scale"], device="cuda"),
     )
-    torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
+    rtol, atol = (2e-3, 2e-3) if q.dtype == torch.float16 else (RTOL, ATOL)
+    torch.testing.assert_close(q_out.flatten(1), q, rtol=rtol, atol=atol)
     assert torch.equal(gate_out.flatten(1), gate)
     if fp8_cache:
         assert_fp8_within_one_ulp(kv_cache, cache.view(torch.float8_e4m3fn))
     else:
-        torch.testing.assert_close(kv_cache, cache, rtol=RTOL, atol=ATOL)
+        torch.testing.assert_close(kv_cache, cache, rtol=rtol, atol=atol)
 
 
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
-@pytest.mark.parametrize("indexer_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "model_dtype,indexer_dtype",
+    [
+        pytest.param(torch.bfloat16, torch.bfloat16, id="bf16"),
+        pytest.param(torch.bfloat16, torch.float8_e4m3fn, id="fp8"),
+        pytest.param(torch.float16, torch.float16, id="fp16"),
+    ],
+)
 @pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,seq_lens,query_lens,history_lens",
     [
@@ -165,6 +175,7 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
     ],
 )
 def test_qsa_fused_prepare_matches_unfused(
+    model_dtype,
     indexer_dtype,
     mrope,
     is_2d_positions,
@@ -178,6 +189,8 @@ def test_qsa_fused_prepare_matches_unfused(
 
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
+    torch.manual_seed(0)
+    rtol, atol = (2e-3, 2e-3) if model_dtype == torch.float16 else (RTOL, ATOL)
     device = "cuda"
     rope_params = {
         "partial_rotary_factor": 0.25,
@@ -192,7 +205,7 @@ def test_qsa_fused_prepare_matches_unfused(
             head_size=256,
             max_position=32768,
             rope_parameters=rope_params,
-            dtype=torch.bfloat16,
+            dtype=model_dtype,
         )
 
     token_to_req = torch.cat(
@@ -280,7 +293,7 @@ def test_qsa_fused_prepare_matches_unfused(
     fused_raw_storage = torch.zeros(
         num_raw_blocks,
         raw_page_elements + 16,
-        dtype=torch.bfloat16,
+        dtype=model_dtype,
         device=device,
     )
     fused_raw = torch.as_strided(
@@ -293,7 +306,7 @@ def test_qsa_fused_prepare_matches_unfused(
         for position in range(history_end - history_len, history_end):
             block = int(raw_block_table[request, 0])
             row = fused_raw[block, position % state_size, 0]
-            row[:D] = torch.randn(D, dtype=torch.bfloat16, device=device)
+            row[:D] = torch.randn(D, dtype=model_dtype, device=device)
             if cache_rope_positions:
                 row[ROPE_POS_OFFSET:].view(torch.int64).copy_(
                     torch.tensor(
@@ -321,14 +334,16 @@ def test_qsa_fused_prepare_matches_unfused(
     # projection. The exact width is unimportant; the larger stride is tested.
     main_qkvg_width = 3584
     projected_qk = torch.randn(
-        num_tokens, main_qkvg_width + (HQ + 1) * D, dtype=torch.bfloat16, device=device
+        num_tokens, main_qkvg_width + (HQ + 1) * D, dtype=model_dtype, device=device
     )[:, main_qkvg_width:]
-    q_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
-    k_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
+    q_weight = torch.randn(D, dtype=model_dtype, device=device) * 0.2
+    k_weight = torch.randn(D, dtype=model_dtype, device=device) * 0.2
 
     fused_query = torch.empty(num_tokens, HQ, D, dtype=indexer_dtype, device=device)
     # The main-attention cache follows the recipe's pairing with the indexer.
-    main = _make_main_inputs(num_tokens, indexer_dtype == torch.float8_e4m3fn)
+    main = _make_main_inputs(
+        num_tokens, indexer_dtype == torch.float8_e4m3fn, model_dtype
+    )
     main_q_out, main_gate_out = qsa_prepare(
         projected_qk[:, : HQ * D],
         projected_qk[:, HQ * D :],
@@ -397,11 +412,11 @@ def test_qsa_fused_prepare_matches_unfused(
         unfused_query = unfused_query.to(indexer_dtype)
         assert_fp8_within_one_ulp(fused_query, unfused_query)
     else:
-        torch.testing.assert_close(fused_query, unfused_query, rtol=RTOL, atol=ATOL)
+        torch.testing.assert_close(fused_query, unfused_query, rtol=rtol, atol=atol)
     assert torch.equal(fused_raw.view(torch.int16), unfused_raw.view(torch.int16))
     if indexer_dtype == torch.float8_e4m3fn:
         assert_fp8_within_one_ulp(fused_compressed, unfused_compressed)
     else:
         torch.testing.assert_close(
-            fused_compressed, unfused_compressed, rtol=RTOL, atol=ATOL
+            fused_compressed, unfused_compressed, rtol=rtol, atol=atol
         )

@@ -734,16 +734,19 @@ def test_qsa_fused_metadata_matches_pytorch_for_large_padded_prefill() -> None:
         (4, 33),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16, torch.float16, torch.float8_e4m3fn],
+    ids=["bf16", "fp16", "fp8"],
+)
 def test_qsa_decode_selection_correctness(
     decode_query_len: int, num_requests: int, dtype: torch.dtype
 ) -> None:
     torch.manual_seed(1)
     heads, head_dim = 4, 128
     rows = num_requests * decode_query_len
-    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16).to(
-        dtype
-    )
+    input_dtype = torch.float16 if dtype == torch.float16 else torch.bfloat16
+    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=input_dtype).to(dtype)
     page_size, pages_per_request, max_sequence_length = (
         (16, 40, 2560) if num_requests > 32 else (4, 20, 320)
     )
@@ -754,7 +757,7 @@ def test_qsa_decode_selection_correctness(
         1,
         head_dim,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=input_dtype,
     ).to(dtype)
     page_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
         num_requests, pages_per_request
@@ -832,7 +835,11 @@ def test_qsa_decode_selection_correctness(
 
 
 @requires_qsa_kernels
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16, torch.float16, torch.float8_e4m3fn],
+    ids=["bf16", "fp16", "fp8"],
+)
 @pytest.mark.parametrize("seq_len_slack", [0, 1792])
 @pytest.mark.parametrize("force_chunk", [False, True])
 def test_qsa_prefill_selection_correctness(
@@ -851,10 +858,9 @@ def test_qsa_prefill_selection_correctness(
     torch.manual_seed(2)
     query_lens = [3, 33]
     rows, heads, head_dim = sum(query_lens), 4, 128
-    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16).to(
-        dtype
-    )
-    cache = torch.randn(128, 24, 1, head_dim, device="cuda", dtype=torch.bfloat16).to(
+    input_dtype = torch.float16 if dtype == torch.float16 else torch.bfloat16
+    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=input_dtype).to(dtype)
+    cache = torch.randn(128, 24, 1, head_dim, device="cuda", dtype=input_dtype).to(
         dtype
     )
     page_table = torch.randperm(128, device="cuda", dtype=torch.int32).reshape(2, 64)
@@ -964,6 +970,7 @@ def test_qsa_block_expansion_correctness() -> None:
 
 
 @requires_qsa_kernels
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(
     (
         "num_rows",
@@ -981,6 +988,11 @@ def test_qsa_block_expansion_correctness() -> None:
         # use_prefill_config variants.
         pytest.param(1, 24, 2, 1600, True, 2, False, id="tp1_r1"),
         pytest.param(16, 12, 1, 1600, True, 3, False, id="tp2_r16"),
+        pytest.param(1, 12, 1, 1568, False, 1, False, id="sm75_tp2_r1"),
+        pytest.param(5, 12, 1, 1600, False, 3, False, id="sm75_tp2_r5"),
+        pytest.param(20, 12, 1, 1568, False, 5, False, id="sm75_tp2_r20"),
+        pytest.param(129, 12, 1, 1600, True, 3, False, id="sm75_tp2_r129"),
+        pytest.param(513, 12, 1, 1568, True, 3, False, id="sm75_tp2_r513"),
         pytest.param(32, 6, 1, 800, True, 5, False, id="tp4_r32"),
         pytest.param(128, 24, 2, 1568, True, 7, False, id="tp1_r128"),
         pytest.param(257, 6, 1, 800, True, 13, False, id="tp4_r257"),
@@ -997,6 +1009,7 @@ def test_qsa_block_expansion_correctness() -> None:
     ],
 )
 def test_qsa_sparse_paged_attention_correctness(
+    dtype: torch.dtype,
     num_rows: int,
     num_query_heads: int,
     num_kv_heads: int,
@@ -1023,9 +1036,7 @@ def test_qsa_sparse_paged_attention_correctness(
     indexer_budget = 2048
     indexer_compress_ratio = 4
     selection_width = indexer_budget + indexer_compress_ratio - 1
-    q = torch.randn(
-        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
+    q = torch.randn(num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype)
     output_gate = torch.randn_like(q)
     kv_cache = torch.randn(
         num_cache_blocks,
@@ -1033,7 +1044,7 @@ def test_qsa_sparse_paged_attention_correctness(
         num_kv_heads,
         2 * head_dim,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
     block_table = (
@@ -1110,8 +1121,12 @@ def test_qsa_sparse_paged_attention_correctness(
 
     actual = qsa_ops.qsa_sparse_paged_attention(
         q,
-        k_cache,
-        v_cache,
+        k_cache.view(torch.uint8)
+        if fp8 and not current_platform.has_device_capability(89)
+        else k_cache,
+        v_cache.view(torch.uint8)
+        if fp8 and not current_platform.has_device_capability(89)
+        else v_cache,
         logical_indices,
         block_table,
         token_to_req,
@@ -1133,7 +1148,105 @@ def test_qsa_sparse_paged_attention_correctness(
     )
     expected = expected * torch.sigmoid(output_gate)
 
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    tolerance = 2e-3 if dtype == torch.float16 else 2e-2
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+@requires_qsa_kernels
+@pytest.mark.skipif(
+    current_platform.get_device_capability() != (7, 5), reason="SM75 native kernel"
+)
+@pytest.mark.parametrize("page_padding", [0, 1024, 5222400 - 1600 * 512, (1 << 31)])
+def test_qsa_sm75_native_empty_invalid_and_partial_rows(
+    monkeypatch, page_padding
+) -> None:
+    """Counts and invalid metadata cannot read unselected or out-of-cache rows."""
+    monkeypatch.setenv("VLLM_RTX8000_NATIVE_QSA", "1")
+    torch.manual_seed(45)
+    q = torch.randn(7, 12, 256, device="cuda", dtype=torch.float16)
+    gate = torch.randn_like(q)
+    page_stride = 1600 * 512 + page_padding
+    storage = torch.empty(page_stride + 1600 * 512, device="cuda", dtype=torch.float16)
+    packed = storage.as_strided((2, 1600, 1, 512), (page_stride, 512, 512, 1))
+    # Only populate actual K/V rows, including a page beyond a 32-bit element
+    # offset; the inter-page padding is deliberately left untouched.
+    packed.normal_()
+    k, v = packed.split(256, dim=-1)
+    table = torch.tensor([[1, 0], [-1, 99]], device="cuda", dtype=torch.int32)
+    requests = torch.tensor([0, 0, 0, 0, -1, 1, 99], device="cuda", dtype=torch.int32)
+    indices = torch.full((7, 2052), -1, device="cuda", dtype=torch.int32)
+    expected = torch.zeros_like(q)
+    for row, count in enumerate((0, 1, 31, 97, 17, 17, 17)):
+        indices[row, :count] = torch.arange(count, device="cuda", dtype=torch.int32)
+        indices[row, -1] = count
+        if row in (1, 2, 3):
+            scores = q[row].float() @ k[1, :count, 0].float().T / 16
+            attention = (scores.softmax(-1) @ v[1, :count, 0].float()).half()
+            expected[row] = (attention.float() * gate[row].float().sigmoid()).half()
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q, k, v, indices, table, requests, False, output_gate=gate
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+
+    # Exercise each compiled plan independently of the production dispatch.
+    # Keep invalid requests/pages and the 64-bit page stride in every plan.
+    for variant in range(5):
+        for splits in (1, 4):
+            partial = torch.empty(splits, 7, 12, 256, device="cuda")
+            lse = torch.empty(splits, 7, 12, device="cuda")
+
+            def run(partial=partial, lse=lse, splits=splits, variant=variant):
+                torch.ops._rtx8000_C.qsa(
+                    q,
+                    k,
+                    v,
+                    indices,
+                    table,
+                    requests,
+                    gate,
+                    actual,
+                    partial,
+                    lse,
+                    splits,
+                    variant,
+                )
+                if splits > 1:
+                    qsa_ops._qsa_merge_splitk_kernel[(7, 12)](
+                        partial,
+                        lse,
+                        actual,
+                        gate,
+                        actual.stride(0),
+                        actual.stride(1),
+                        gate.stride(0),
+                        gate.stride(1),
+                        7,
+                        HEAD_DIM=256,
+                        NUM_QUERY_HEADS=12,
+                        NUM_SPLITS=splits,
+                        BLOCK_SPLITS=splits,
+                        num_warps=2,
+                        num_stages=1,
+                    )
+
+            actual.fill_(float("nan"))
+            run()
+            torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            # A new count and request mapping must be read on replay, rather
+            # than retaining the metadata used when the graph was captured.
+            requests[1] = -1
+            indices[3, -1] = 0
+            actual.fill_(float("nan"))
+            graph.replay()
+            replay_expected = expected.clone()
+            replay_expected[1] = 0
+            replay_expected[3] = 0
+            torch.testing.assert_close(actual, replay_expected, atol=2e-3, rtol=2e-3)
+            requests[1] = 0
+            indices[3, -1] = 97
 
 
 @requires_qsa_kernels

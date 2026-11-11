@@ -545,6 +545,28 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     endif()
     FetchContent_MakeAvailable(cutlass)
 
+    cuda_archs_loose_intersection(RTX8000_ARCHS "7.5" "${CUDA_ARCHS}")
+    if(RTX8000_ARCHS)
+      include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/rtx8000/qsa_variants.cmake")
+      include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/rtx8000/dense_mma_variants.cmake")
+      set(RTX8000_KERNEL_SRC "csrc/rtx8000/qsa.cu" "csrc/rtx8000/dense.cu"
+        "csrc/rtx8000/gdn_o_q16.cu" "csrc/rtx8000/gdn_o_q32.cu"
+        "csrc/rtx8000/dense_mma.cu"
+        "csrc/rtx8000/gdn_h_v8.cu" "csrc/rtx8000/gdn_h_v16.cu"
+        ${RTX8000_QSA_SOURCES} ${RTX8000_DENSE_MMA_SOURCES})
+      set_gencode_flags_for_srcs(SRCS "${RTX8000_KERNEL_SRC}" CUDA_ARCHS "${RTX8000_ARCHS}")
+      define_extension_target(_rtx8000_C DESTINATION vllm LANGUAGE CUDA
+        SOURCES csrc/rtx8000/torch_bindings.cpp
+          csrc/rtx8000/gdn_o_bindings.cpp csrc/rtx8000/gdn_h_bindings.cpp
+          ${RTX8000_KERNEL_SRC}
+        COMPILE_FLAGS ${VLLM_GPU_FLAGS} ARCHITECTURES 75
+        USE_SABI 3.9 WITH_SOABI)
+      target_include_directories(_rtx8000_C PRIVATE ${cutlass_SOURCE_DIR}/include)
+      set_target_properties(_rtx8000_C PROPERTIES CXX_STANDARD 20)
+    else()
+      add_custom_target(_rtx8000_C)
+    endif()
+
     list(APPEND VLLM_STABLE_EXT_SRC
       "csrc/quantization/w8a8/cutlass/scaled_mm_entry.cu"
       "csrc/quantization/fp4/nvfp4_quant_entry.cu"
@@ -1549,6 +1571,37 @@ define_extension_target(
 # which is currently set to 2.11.
 target_compile_definitions(_moe_C_stable_libtorch PRIVATE
   TORCH_TARGET_VERSION=0x020B000000000000ULL)
+
+# Keep the RTX8000 policy and two guarded kernels separate from the complete
+# MoE extension. The stock template and library remain unchanged.
+if(VLLM_GPU_LANG STREQUAL "CUDA" AND RTX8000_ARCHS)
+  set(RTX8000_MARLIN_PYTHON "${Python_EXECUTABLE}")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/marlin_moe_wna16/rtx8000/guarded.cmake")
+  set_gencode_flags_for_srcs(SRCS "${RTX8000_MARLIN_CUDA_SOURCES}"
+    CUDA_ARCHS "${RTX8000_ARCHS}")
+  define_extension_target(_rtx8000_marlin_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES ${RTX8000_MARLIN_CUDA_SOURCES}
+      "${RTX8000_MARLIN_GUARDED_TEMPLATE}"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES 75 USE_SABI 3 WITH_SOABI)
+  target_include_directories(_rtx8000_marlin_C PRIVATE
+    "${RTX8000_MARLIN_GENERATED_DIR}")
+  target_compile_definitions(_rtx8000_marlin_C PRIVATE USE_CUDA
+    TORCH_TARGET_VERSION=0x020B000000000000ULL)
+  # MODULE targets cannot be linked as CMake libraries. Link their filename
+  # instead, retaining an explicit build dependency and relocatable DT_NEEDED.
+  add_dependencies(_rtx8000_marlin_C _moe_C_stable_libtorch)
+  target_link_directories(_rtx8000_marlin_C PRIVATE
+    "$<TARGET_FILE_DIR:_moe_C_stable_libtorch>")
+  target_link_libraries(_rtx8000_marlin_C PRIVATE
+    "-Wl,--no-as-needed" "-l:$<TARGET_FILE_NAME:_moe_C_stable_libtorch>"
+    "-Wl,--as-needed")
+  set_target_properties(_rtx8000_marlin_C PROPERTIES CXX_STANDARD 20
+    BUILD_RPATH "$<TARGET_FILE_DIR:_moe_C_stable_libtorch>"
+    INSTALL_RPATH "$ORIGIN")
+elseif(VLLM_GPU_LANG STREQUAL "CUDA")
+  add_custom_target(_rtx8000_marlin_C)
+endif()
 
 # Needed to use cuda/hip APIs from C-shim
 if(VLLM_GPU_LANG STREQUAL "CUDA")

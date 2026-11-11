@@ -263,7 +263,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
             hidden_size=config.hidden_size,
-            params_dtype=torch.bfloat16,
+            params_dtype=model_config.dtype,
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
@@ -487,6 +487,12 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+    ) -> torch.Tensor:
+        """Select greedy draft tokens using the vocab-parallel reduction."""
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():

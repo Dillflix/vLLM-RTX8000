@@ -320,7 +320,54 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+    from .rtx8000 import report_tiles, try_native_state, use_state_tiles
+
+    if try_native_state(
+        k,
+        w,
+        u,
+        g,
+        gk,
+        initial_state,
+        cu_seqlens,
+        chunk_offsets,
+        h,
+        v_new,
+        final_state,
+        BT,
+        use_exp2,
+    ):
+        return h, v_new, final_state
+
+    kernel = chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+    launch_options = {}
+    if use_state_tiles(
+        k,
+        w,
+        u,
+        g,
+        gk,
+        initial_state,
+        cu_seqlens,
+        BT,
+        output_final_state,
+        save_new_value,
+        use_exp2,
+    ):
+        report_tiles("state")
+        kernel = kernel.fn.fn
+        launch_options = dict(
+            BV=16,
+            num_warps=4,
+            num_stages=2,
+            USE_G=True,
+            USE_GK=False,
+            USE_INITIAL_STATE=True,
+            STORE_FINAL_STATE=True,
+            SAVE_NEW_VALUE=True,
+            IS_VARLEN=cu_seqlens is not None,
+        )
+    kernel[grid](
         k=k,
         v=u,
         w=w,
@@ -339,5 +386,6 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         USE_EXP2=use_exp2,
+        **launch_options,
     )
     return h, v_new, final_state

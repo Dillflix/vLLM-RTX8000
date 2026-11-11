@@ -1530,3 +1530,111 @@ def test_fallback_preserves_default_method() -> None:
     output = method.apply(SimpleNamespace(weight=weight), x)
 
     torch.testing.assert_close(output, torch.nn.functional.linear(x, weight))
+
+
+@pytest.mark.skipif(
+    current_platform.get_device_capability() != (7, 5),
+    reason="Native RTX8000 FP16 kernels require SM75",
+)
+@pytest.mark.parametrize(
+    "shape", [(48, 2560), (512, 2560), (2560, 320), (336, 10240), (124160, 2560)]
+)
+def test_rtx8000_native_dense_variants_and_dispatch(shape, monkeypatch) -> None:
+    """Every native variant matches FP32; unplanned batch sizes retain fallback."""
+    from vllm.models.qwen4_exp.nvidia.ops.rtx8000 import load_native
+
+    load_native()
+    monkeypatch.setenv("VLLM_RTX8000_NATIVE_DENSE", "1")
+    torch.manual_seed(21)
+    n, k = shape
+    weight = torch.randn(n, k, device="cuda", dtype=torch.float16) * 0.02
+    for m in (1, 2, 4, 5, 8, 12, 16, 20):
+        x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        expected = (x.float() @ weight.float().T).half()
+        for variant in range(12 if m <= 16 else 4):
+            out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.float16)
+            torch.ops._rtx8000_C.dense(x, weight, out, variant)
+            torch.testing.assert_close(out, expected, atol=5e-3, rtol=5e-3)
+            error = (out.float() - expected.float()).square().mean().sqrt()
+            rms = expected.float().square().mean().sqrt()
+            assert error / rms.clamp_min(1e-12) <= 1e-3
+        actual = torch.ops.vllm.qwen4_exp_low_latency_gemm(x, weight)
+        torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+        if m == 12:
+            # Replay must read changed inputs and overwrite every output. This
+            # covers tail N=48/336 as well as the real 124160-column head shard.
+            for variant in range(4, 12):
+                torch.ops._rtx8000_C.dense(x, weight, out, variant)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    torch.ops._rtx8000_C.dense(x, weight, out, variant)
+                x.neg_()
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.testing.assert_close(out, -expected, atol=5e-3, rtol=5e-3)
+                x.neg_()
+    x = torch.randn(3, k, device="cuda", dtype=torch.float16)
+    torch.testing.assert_close(
+        torch.ops.vllm.qwen4_exp_low_latency_gemm(x, weight),
+        torch.nn.functional.linear(x, weight),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(
+    current_platform.get_device_capability() != (7, 5),
+    reason="Native RTX8000 FP16 kernels require SM75",
+)
+def test_rtx8000_native_dense_head_preserves_fallbacks(
+    dist_init, default_vllm_config, monkeypatch
+) -> None:
+    """A real head retains embedding, bias, strided-input, and FP32 behavior."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    from vllm.models.qwen4_exp.nvidia.low_latency_gemm import (
+        Qwen4ExpLowLatencyEmbeddingMethod,
+        enable_qwen4_exp_low_latency_gemm,
+    )
+
+    monkeypatch.setenv("VLLM_RTX8000_NATIVE_DENSE", "1")
+    # A small real head with an already qualified projection shape exercises
+    # registration without adding an unmeasured large-vocabulary dispatch plan.
+    head = ParallelLMHead(512, 2560, params_dtype=torch.float16).cuda()
+    with torch.no_grad():
+        head.weight.normal_(std=0.02)
+    original = head.quant_method
+    x = torch.randn(4, 2560, device="cuda", dtype=torch.float16)
+    expected = original.apply(head, x)
+    enable_qwen4_exp_low_latency_gemm(head, torch.float16)
+    assert type(head.quant_method) is Qwen4ExpLowLatencyEmbeddingMethod
+    torch.testing.assert_close(
+        head.quant_method.apply(head, x), expected, atol=5e-3, rtol=5e-3
+    )
+    ids = torch.tensor([0, 17, 511], device="cuda")
+    torch.testing.assert_close(
+        head.quant_method.embedding(head, ids),
+        original.embedding(head, ids),
+        atol=0,
+        rtol=0,
+    )
+    bias = torch.randn(512, device="cuda", dtype=torch.float16)
+    torch.testing.assert_close(
+        head.quant_method.apply(head, x, bias),
+        original.apply(head, x, bias),
+        atol=0,
+        rtol=0,
+    )
+    strided = torch.randn(4, 5120, device="cuda", dtype=torch.float16)[:, ::2]
+    torch.testing.assert_close(
+        head.quant_method.apply(head, strided),
+        original.apply(head, strided),
+        atol=0,
+        rtol=0,
+    )
+    head.float()
+    torch.testing.assert_close(
+        head.quant_method.apply(head, x.float()),
+        original.apply(head, x.float()),
+        atol=0,
+        rtol=0,
+    )

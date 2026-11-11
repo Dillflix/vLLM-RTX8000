@@ -13,7 +13,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
-IndexerKVDType = Literal["auto", "bf16", "fp8", "mxfp4", "nvfp4"]
+IndexerKVDType = Literal["auto", "bf16", "fp16", "fp8", "mxfp4", "nvfp4"]
 MiniMaxM3MSADecodeBackend = Literal["triton", "cutlass"]
 
 
@@ -100,7 +100,8 @@ class AttentionConfig:
 
     indexer_kv_dtype: IndexerKVDType | str = "auto"
     """Data type for the sparse-attention indexer K cache. "auto" picks the
-    model's default (bf16 for MiniMax M3, fp8 for the DeepSeek sparse
+    model's default (model dtype for Qwen4Exp, bf16 for MiniMax M3,
+    fp8 for the DeepSeek sparse
     indexer, mxfp4 for DeepSeek-V4 on ROCm CDNA4 with aiter). Quantized
     formats (fp8, mxfp4, nvfp4) require indexer kernel support in the
     backend; MiniMax M3 supports nvfp4 on SM100/SM103/SM107 with at most 8

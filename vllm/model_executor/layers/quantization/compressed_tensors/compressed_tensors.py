@@ -174,6 +174,14 @@ class CompressedTensorsConfig(QuantizationConfig):
             if quant_scheme is not None:
                 layer.scheme = quant_scheme
                 quant_method = CompressedTensorsLinearMethod(self)
+            elif not any((input_tfms, output_tfms)):
+                from vllm.model_executor.layers.quantization.utils.rtx8000_cutlass_prefill import (  # noqa: E501
+                    maybe_cutlass_prefill_method,
+                )
+
+                quant_method = (
+                    maybe_cutlass_prefill_method(layer, prefix) or quant_method
+                )
 
             # choose transform method
             if any((input_tfms, output_tfms)):

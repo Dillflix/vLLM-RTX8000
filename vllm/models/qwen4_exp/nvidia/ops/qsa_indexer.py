@@ -402,12 +402,13 @@ def _prefill_logits(
         num_queries, logits_width
     )
 
-    # tuned on GB300
-    if k_cache.dtype == torch.float8_e4m3fn:
-        TILE_R, STAGES, num_warps = 32, 2, 8
+    if current_platform.get_device_capability() == (7, 5):
+        # thecyberdevl's RTX 8000 profile: 48 KiB shared memory on Triton 3.7.
+        TILE_R, BLOCK_N, STAGES, num_warps = 16, 32, 2, 8
+    elif k_cache.dtype == torch.float8_e4m3fn:
+        TILE_R, BLOCK_N, STAGES, num_warps = 32, 64, 2, 8
     else:
-        TILE_R, STAGES, num_warps = 64, 2, 4
-    BLOCK_N = 64
+        TILE_R, BLOCK_N, STAGES, num_warps = 64, 64, 2, 4
     K_TILES = 16
     grid = (
         page_table.shape[0],

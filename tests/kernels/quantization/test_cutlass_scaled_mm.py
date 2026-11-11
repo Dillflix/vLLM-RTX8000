@@ -776,3 +776,88 @@ def test_cutlass_fp8_group_gemm(
         baseline = baseline_tensors[g]
         c = out_tensors_stacked[expert_offsets[g] : expert_offsets[g + 1]]
         torch.testing.assert_close(c, baseline, rtol=1e-2, atol=5e-4)
+
+
+@pytest.mark.parametrize(
+    "prefill,decode,spec",
+    [(0, 5, 0), (127, 0, 0), (128, 0, 0), (128, 5, 0), (128, 0, 2)],
+)
+@torch.inference_mode()
+def test_rtx8000_cutlass_prefill_preserves_decode_rows(
+    monkeypatch, dist_init, prefill, decode, spec
+):
+    """Only large, non-speculative prefill rows may use activation quantization."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.linear import (
+        ColumnParallelLinear,
+        UnquantizedLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+        CompressedTensorsConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.rtx8000_cutlass_prefill import (
+        RTX8000CutlassPrefillMethod,
+    )
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    if current_platform.get_device_capability() != (7, 5):
+        pytest.skip("This opt-in path is restricted to SM75")
+    monkeypatch.setenv("VLLM_RTX8000_CUTLASS_PREFILL", "1")
+    torch.manual_seed(411)
+    config = VllmConfig()
+    prefix = "model.layers.0.linear_attn"
+    with set_current_vllm_config(config), torch.device("cuda"):
+        quant = CompressedTensorsConfig.from_config(
+            {"format": "pack-quantized", "config_groups": {}, "ignore": []}
+        )
+        layer = ColumnParallelLinear(
+            2560,
+            8192,
+            bias=False,
+            params_dtype=torch.float16,
+            quant_config=quant,
+            prefix=prefix + ".in_proj_qkvz",
+            disable_tp=True,
+        )
+        layer.weight.copy_(torch.randn_like(layer.weight) * 0.02)
+        layer.quant_method.process_weights_after_loading(layer)
+        x = torch.randn(prefill + decode + spec, 2560, dtype=torch.float16) * 0.1
+        metadata = GDNAttentionMetadata(
+            num_prefills=int(prefill > 0),
+            num_prefill_tokens=prefill,
+            num_decodes=decode,
+            num_decode_tokens=decode,
+            num_spec_decodes=int(spec > 0),
+            num_spec_decode_tokens=spec,
+            num_actual_tokens=x.shape[0],
+        )
+        plain = UnquantizedLinearMethod()
+        use_cutlass = prefill >= 128 and not spec
+        if use_cutlass:
+            q, a_scales, _ = ops.scaled_int8_quant(x[decode:])
+            quantized = ops.cutlass_scaled_mm(
+                q,
+                layer.cutlass_prefill_weight,
+                a_scales,
+                layer.cutlass_prefill_scale,
+                torch.float16,
+            )
+            expected = (
+                torch.cat([plain.apply(layer, x[:decode]), quantized])
+                if decode
+                else quantized
+            )
+        else:
+            expected = plain.apply(layer, x)
+        with set_forward_context({prefix: metadata}, config):
+            actual, _ = layer(x)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert isinstance(layer.quant_method, RTX8000CutlassPrefillMethod)
+        assert layer.quant_method.prefill_calls == int(use_cutlass)
+
+        # Profiling without attention metadata must use the original FP16 path.
+        expected = plain.apply(layer, x)
+        with set_forward_context(None, config):
+            actual, _ = layer(x)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

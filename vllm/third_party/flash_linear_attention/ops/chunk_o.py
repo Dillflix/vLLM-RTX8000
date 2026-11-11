@@ -164,10 +164,28 @@ def chunk_fwd_o(
     else:
         o = torch.empty_like(v)
 
+    from .rtx8000 import report_tiles, try_native_output, use_output_tiles
+
+    if try_native_output(q, k, v, h, g, cu_seqlens, chunk_indices, o, scale, BT):
+        return o
+
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_fwd_kernel_o[grid](
+    kernel = chunk_fwd_kernel_o
+    launch_options = {}
+    if use_output_tiles(q, k, v, h, g, cu_seqlens, BT):
+        report_tiles("output")
+        kernel = kernel.fn.fn
+        launch_options = dict(
+            BK=32,
+            BV=64,
+            num_warps=8,
+            num_stages=2,
+            USE_G=True,
+            IS_VARLEN=cu_seqlens is not None,
+        )
+    kernel[grid](
         q,
         k,
         v,
@@ -183,5 +201,6 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        **launch_options,
     )
     return o

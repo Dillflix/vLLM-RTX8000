@@ -26,13 +26,16 @@ from vllm.config import (
 )
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
+    get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.linear import RowParallelLinear
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -313,3 +316,84 @@ def test_moe_sp_equivalence(monkeypatch) -> None:
 def test_compiled_sp_ops_handle_untraced_token_counts() -> None:
     """Padding in compiled SP collectives must not specialize on the traced size."""
     mp.spawn(_run_sp, args=(get_open_port(), False, True), nprocs=2)
+
+
+def _run_mtp_local_argmax(rank: int, port: int) -> None:
+    """Use the real sharded head and reduction called by Qwen4ExpMTP."""
+    torch.accelerator.set_device_index(rank)
+    torch.set_num_threads(1)
+    config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=2))
+    init_distributed_environment(
+        world_size=2,
+        rank=rank,
+        local_rank=rank,
+        distributed_init_method=f"tcp://127.0.0.1:{port}",
+    )
+    try:
+        with set_current_vllm_config(config):
+            initialize_model_parallel(tensor_model_parallel_size=2)
+            with torch.device(f"cuda:{rank}"), torch.inference_mode():
+                vocab_size, hidden_size = 257, 16
+                head = ParallelLMHead(
+                    vocab_size, hidden_size, params_dtype=torch.float16
+                )
+                processors = [
+                    LogitsProcessor(vocab_size),
+                    LogitsProcessor(
+                        vocab_size, org_vocab_size=250, scale=0.5, soft_cap=3
+                    ),
+                ]
+                full_weight = torch.zeros(vocab_size, hidden_size, dtype=torch.float16)
+                # Cross-rank tie, within-rank tie, rank-1 winner, final real row.
+                full_weight[[3, 171], 0] = 4
+                full_weight[[10, 11], 1] = 3
+                full_weight[200, 2] = 5
+                full_weight[256, 3] = 6
+                hidden = torch.zeros(5, hidden_size, dtype=torch.float16)
+                hidden[:4, :4] = torch.eye(4, dtype=torch.float16)
+
+                for random_inputs in (False, True):
+                    if random_inputs:
+                        torch.manual_seed(17)
+                        full_weight.normal_(std=0.1)
+                        hidden.normal_()
+                    head.weight_loader(head.weight, full_weight)
+                    padding = head.shard_indices.num_org_vocab_padding
+                    if padding:
+                        # Padding would beat every deterministic valid logit.
+                        head.weight[-padding:].fill_(100)
+                    for processor in processors:
+                        for count in (1, 5):
+                            states = hidden[:count]
+                            logits = processor(head, states)
+                            top = processor.get_top_tokens(head, states)
+                            expected = torch.empty(count, dtype=torch.int64)
+                            if rank == 0:
+                                assert logits is not None
+                                expected.copy_(logits.argmax(dim=-1))
+                                if not random_inputs:
+                                    known = [
+                                        3,
+                                        10,
+                                        200,
+                                        256 if processor.org_vocab_size == 257 else 0,
+                                        0,
+                                    ]
+                                    torch.testing.assert_close(
+                                        expected,
+                                        torch.tensor(known[:count]),
+                                        atol=0,
+                                        rtol=0,
+                                    )
+                            get_tp_group().broadcast(expected, src=0)
+                            torch.testing.assert_close(top, expected, atol=0, rtol=0)
+                            assert top.dtype == torch.int64
+                            assert (top < processor.org_vocab_size).all()
+    finally:
+        cleanup_dist_env_and_memory()
+
+
+@multi_gpu_test(num_gpus=2)
+def test_mtp_local_argmax_matches_full_logits_with_ties_and_padding() -> None:
+    """The greedy MTP reduction preserves exact tokens on both TP ranks."""
+    mp.spawn(_run_mtp_local_argmax, args=(get_open_port(),), nprocs=2)

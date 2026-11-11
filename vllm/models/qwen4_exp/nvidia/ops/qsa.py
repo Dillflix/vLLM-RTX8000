@@ -8,6 +8,7 @@ from functools import lru_cache
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_scalar_specialization_rep,
@@ -15,6 +16,11 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.models.qwen4_exp.nvidia.ops import qsa_fp8
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+
+
+@lru_cache(maxsize=1)
+def _is_sm75() -> bool:
+    return current_platform.get_device_capability() == (7, 5)
 
 
 @lru_cache(maxsize=1)
@@ -629,6 +635,11 @@ def _select_config(
         # Wider tiles measured faster for the byte-decode path on A100;
         # unmeasured on sm_86, which keeps the table's tiles.
         BLOCK_N, num_warps = 128, 4
+    if _is_sm75():
+        # thecyberdevl's RTX 8000 profile fits Turing's shared-memory budget.
+        # Limit splits so the FP32 merge also fits its register budget.
+        BLOCK_N, num_warps = 16, 4
+        target_splits = min(target_splits, 16)
     num_tiles = triton.cdiv(num_columns, BLOCK_N)
     # Never more splits than tiles, never empty.
     num_splits = min(target_splits, num_tiles)
@@ -681,9 +692,9 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == torch.bfloat16
+    assert q.dtype in (torch.bfloat16, torch.float16)
     assert k_cache.dtype == v_cache.dtype
-    is_fp8 = k_cache.dtype != torch.bfloat16
+    is_fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.uint8)
     if is_fp8:
         assert k_scale is not None and v_scale is not None
         # Host pre-multiply: fold the K dequant scale into the attention scale
@@ -698,6 +709,7 @@ def qsa_sparse_paged_attention(
         else:
             assert k_cache.dtype == torch.float8_e4m3fn
     else:
+        assert k_cache.dtype == q.dtype
         softmax_scale = head_dim**-0.5
         output_scale = 1.0
     assert logical_indices.dtype == block_table.dtype == torch.int32
@@ -720,7 +732,31 @@ def qsa_sparse_paged_attention(
     if not q.shape[0]:
         return out
 
-    if qsa_fp8.use_fp8_decode_kernel(q.shape[0] * k_cache.shape[2], k_cache.dtype):
+    if envs.VLLM_RTX8000_NATIVE_QSA and _is_sm75():
+        from . import rtx8000
+
+        if rtx8000.supports_qsa(q, k_cache, v_cache, out):
+            return rtx8000.sparse(
+                q,
+                k_cache,
+                v_cache,
+                logical_indices,
+                block_table,
+                token_to_req,
+                out,
+                output_gate_view,
+            )
+        rtx8000.report_fallback(
+            tuple(q.shape[1:]),
+            q.stride(),
+            tuple(k_cache.shape[1:]),
+            k_cache.stride(),
+            v_cache.data_ptr() - k_cache.data_ptr(),
+        )
+
+    if q.dtype == torch.bfloat16 and qsa_fp8.use_fp8_decode_kernel(
+        q.shape[0] * k_cache.shape[2], k_cache.dtype
+    ):
         return qsa_fp8.qsa_sparse_paged_decode(
             q,
             k_cache,
@@ -762,7 +798,7 @@ def _qsa_sparse_paged_splitk(
     output_scale: float,
 ) -> torch.Tensor:
     """The split-K kernel (and merge) at _select_config's config."""
-    is_fp8 = k_cache.dtype != torch.bfloat16
+    is_fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.uint8)
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
@@ -859,6 +895,7 @@ def warmup_qsa_sparse_paged_attention(
     *,
     num_query_heads: int,
     selection_width: int,
+    query_dtype: torch.dtype,
 ) -> tuple[tuple[int | str, ...], ...]:
     """Compile every production-reachable split-K/merge and decode
     specialization."""
@@ -891,9 +928,7 @@ def warmup_qsa_sparse_paged_attention(
     # on the kernels, so any value here compiles the only variant.
     num_rows = 16
     num_requests = 16
-    q_ptr = TritonWarmupTensor(
-        torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
-    )
+    q_ptr = TritonWarmupTensor(query_dtype, shape=(num_rows, num_query_heads, head_dim))
     k_cache_ptr = TritonWarmupTensor(
         cache_dtype,
         shape=tuple(key_cache.shape),
@@ -913,11 +948,11 @@ def warmup_qsa_sparse_paged_attention(
     )
     token_to_req_ptr = TritonWarmupTensor(torch.int32)
     output_ptr = TritonWarmupTensor(
-        torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
+        query_dtype, shape=(num_rows, num_query_heads, head_dim)
     )
     # The output gate is mandatory at runtime; warm the gated specialization.
     output_gate_ptr = TritonWarmupTensor(
-        torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
+        query_dtype, shape=(num_rows, num_query_heads, head_dim)
     )
     head_stride = head_dim
     row_stride = num_query_heads * head_dim
@@ -1001,12 +1036,45 @@ def warmup_qsa_sparse_paged_attention(
             )
         warmed.append((block_n, num_splits, warps))
 
-    warmed += qsa_fp8.warmup_qsa_fp8_decode(
-        kv_cache,
-        block_table,
-        num_query_heads=num_query_heads,
-        selection_width=selection_width,
-    )
+    if (
+        envs.VLLM_RTX8000_NATIVE_QSA
+        and _is_sm75()
+        and query_dtype == cache_dtype == torch.float16
+        and num_query_heads == 12
+        and num_kv_heads == 1
+        and head_dim == 256
+    ):
+        from .rtx8000 import load_native
+
+        load_native()
+        # Native decode adds a 32-way split. Compile its merge before graph capture.
+        _qsa_merge_splitk_kernel.warmup(
+            TritonWarmupTensor(torch.float32, shape=(32, num_rows, 12, 256)),
+            TritonWarmupTensor(torch.float32, shape=(32, num_rows, 12)),
+            output_ptr,
+            output_gate_ptr,
+            row_stride,
+            head_stride,
+            row_stride,
+            head_stride,
+            num_rows,
+            HEAD_DIM=256,
+            NUM_QUERY_HEADS=12,
+            NUM_SPLITS=32,
+            BLOCK_SPLITS=32,
+            num_warps=2,
+            num_stages=1,
+            grid=(num_rows, 12),
+        )
+        warmed.append(("sm75-native-merge", 32, 2))
+
+    if query_dtype == torch.bfloat16:
+        warmed += qsa_fp8.warmup_qsa_fp8_decode(
+            kv_cache,
+            block_table,
+            num_query_heads=num_query_heads,
+            selection_width=selection_width,
+        )
     return tuple(warmed)
 
 

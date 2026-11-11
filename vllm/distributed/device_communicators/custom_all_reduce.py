@@ -83,21 +83,99 @@ def _group_can_attempt_mnnvl(
     return _all_ranks_true(group, local_support)
 
 
-def _can_p2p(rank: int, world_size: int) -> bool:
-    for i in range(world_size):
-        if i == rank:
+def _p2p_device_indices(
+    physical_device_ids: list[int],
+) -> tuple[list[int], list[int], list[int]]:
+    """Map group members to this process's logical and visible namespaces."""
+    from vllm.platforms.interface import get_assigned_physical_gpu_ids
+
+    assigned_ids = get_assigned_physical_gpu_ids()
+    count = (
+        len(assigned_ids)
+        if assigned_ids is not None
+        else current_platform.device_count()
+    )
+    logical_physical_ids = [
+        current_platform.device_id_to_physical_device_id(i) for i in range(count)
+    ]
+    if len(set(logical_physical_ids)) != count:
+        raise ValueError("Duplicate devices in the local GPU mapping")
+    # The cached probe covers the complete logical mapping. Validate its
+    # visibility before a rank enters the collective cache initialization.
+    logical_visible_ids = [
+        current_platform.logical_device_id_to_visible_device_id(i) for i in range(count)
+    ]
+    logical_ids = [logical_physical_ids.index(i) for i in physical_device_ids]
+    visible_ids = [logical_visible_ids[i] for i in logical_ids]
+    return logical_physical_ids, logical_ids, visible_ids
+
+
+def _can_p2p(
+    rank: int,
+    logical_ids: list[int],
+    visible_ids: list[int],
+    skip_probe: bool,
+) -> bool:
+    """Check every outgoing peer using device IDs, never TP subgroup ranks."""
+    if skip_probe:
+        logger.debug("Skipping P2P check and trusting the driver's P2P report.")
+    for peer in range(len(logical_ids)):
+        if peer == rank:
             continue
-        if envs.VLLM_SKIP_P2P_CHECK:
-            logger.debug("Skipping P2P check and trusting the driver's P2P report.")
-            # can_device_access_peer takes visible device ordinals, while
-            # rank and i are logical local IDs.
-            return torch.cuda.can_device_access_peer(
-                current_platform.logical_device_id_to_visible_device_id(rank),
-                current_platform.logical_device_id_to_visible_device_id(i),
+        if skip_probe:
+            accessible = torch.cuda.can_device_access_peer(
+                visible_ids[rank], visible_ids[peer]
             )
-        if not gpu_p2p_access_check(rank, i):
+        else:
+            accessible = gpu_p2p_access_check(logical_ids[rank], logical_ids[peer])
+        if not accessible:
             return False
     return True
+
+
+def _group_can_p2p(group: ProcessGroup, physical_device_ids: list[int]) -> bool:
+    """Qualify actual group devices and agree before allocating IPC buffers.
+
+    Cache initialization must use this CPU group, not a world-group barrier:
+    another PP stage can legitimately fall back without entering the probe.
+    """
+    rank = dist.get_rank(group=group)
+    skip_probe = envs.VLLM_SKIP_P2P_CHECK
+    mapping: list[int] = []
+    logical_ids: list[int] = []
+    visible_ids: list[int] = []
+    metadata: tuple[list[int], bool] | None = None
+    try:
+        mapping, logical_ids, visible_ids = _p2p_device_indices(physical_device_ids)
+        metadata = (mapping, skip_probe)
+    except Exception as error:
+        logger.warning("Custom allreduce device mapping is unavailable: %s", error)
+
+    group_metadata: list[tuple[list[int], bool] | None] = [None] * len(
+        physical_device_ids
+    )
+    dist.all_gather_object(group_metadata, metadata, group=group)
+    valid_metadata = [item for item in group_metadata if item is not None]
+    if len(valid_metadata) != len(group_metadata):
+        return False
+    # The leader broadcasts a cache indexed by its logical mapping. Different
+    # visible orderings are fine when the assigned logical mapping is identical;
+    # otherwise conservatively use NCCL. Driver-only probes need no shared map.
+    if any(item[1] != skip_probe for item in valid_metadata):
+        return False
+    if not skip_probe and any(item[0] != mapping for item in valid_metadata):
+        return False
+
+    local_result = False
+    try:
+        if not skip_probe:
+            # All ranks enter once, even if some already have a process-local
+            # cache. Later per-peer lookups are local and cannot strand a peer.
+            gpu_p2p_access_check(logical_ids[rank], logical_ids[rank], group=group)
+        local_result = _can_p2p(rank, logical_ids, visible_ids, skip_probe)
+    except Exception as error:
+        logger.warning("Custom allreduce P2P probe failed: %s", error)
+    return _all_ranks_true(group, local_result)
 
 
 def _supports_mnnvl_multimem_reduce_scatter(
@@ -253,9 +331,18 @@ class CustomAllreduce:
         # device.index is a visible ordinal, not a logical local ID.
         fully_connected = False
         if same_node:
-            physical_device_id = (
-                current_platform.visible_device_id_to_physical_device_id(device.index)
-            )
+            physical_device_id = -1
+            try:
+                if device.index is not None:
+                    physical_device_id = (
+                        current_platform.visible_device_id_to_physical_device_id(
+                            device.index
+                        )
+                    )
+            except Exception as error:
+                logger.warning(
+                    "Custom allreduce device identity is unavailable: %s", error
+                )
             tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
             gather_list = [
                 torch.tensor([0], dtype=torch.int, device="cpu")
@@ -263,8 +350,22 @@ class CustomAllreduce:
             ]
             dist.all_gather(gather_list, tensor, group=self.group)
             physical_device_ids = [t.item() for t in gather_list]
+            if (
+                min(physical_device_ids) < 0
+                or len(set(physical_device_ids)) != world_size
+            ):
+                logger.warning("Custom allreduce requires distinct, identifiable GPUs.")
+                return
             assert current_platform.is_cuda_alike()
-            fully_connected = current_platform.is_fully_connected(physical_device_ids)
+            try:
+                fully_connected = current_platform.is_fully_connected(
+                    physical_device_ids
+                )
+            except Exception as error:
+                logger.warning(
+                    "Custom allreduce NVLink topology probe failed: %s", error
+                )
+            fully_connected = _all_ranks_true(self.group, fully_connected)
         if same_node and world_size > 2 and not fully_connected:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
@@ -279,7 +380,7 @@ class CustomAllreduce:
         if (
             same_node
             and not current_platform.is_rocm()
-            and not _can_p2p(rank, world_size)
+            and not _group_can_p2p(self.group, physical_device_ids)
         ):
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "

@@ -338,26 +338,18 @@ def can_actually_p2p(
 # Note that the cache file is suffixed by the CUDA_VISIBLE_DEVICES, so that we
 #  can have different cache files for different CUDA_VISIBLE_DEVICES settings,
 #  e.g. used by different vllm engines. The device id in the cache file is a
-#  **local** device id, i.e. from 0 to num_dev-1, where num_dev is the number
-#  of visible devices in the vllm engine.
+#  **logical** device id, i.e. from 0 to num_dev-1 in the engine's assigned
+#  GPU mapping (or visible-device order when no mapping has been assigned).
 _gpu_p2p_access_cache: dict[str, bool] | None = None
 
 
-def gpu_p2p_access_check(src: int, tgt: int) -> bool:
-    """Check if GPU src can access GPU tgt."""
-    # if the cache variable is already calculated,
-    # read from the cache instead of checking it again
-    global _gpu_p2p_access_cache
-    if _gpu_p2p_access_cache is not None:
-        return _gpu_p2p_access_cache[f"{src}->{tgt}"]
-
-    is_distributed = dist.is_initialized()
-
+def _read_or_generate_gpu_p2p_access_cache() -> dict[str, bool]:
+    """Load/probe one logical device mapping without distributed barriers."""
     from vllm.platforms.interface import get_assigned_physical_gpu_ids
 
     assigned_physical_gpu_ids = get_assigned_physical_gpu_ids()
     if assigned_physical_gpu_ids is not None:
-        # Key by the ordered list: the cache stores directed local-index
+        # Key by the ordered list: the cache stores directed logical-index
         # pairs, so permutations of the same set are distinct mappings.
         cache_key = ",".join(str(i) for i in assigned_physical_gpu_ids)
         num_dev = len(assigned_physical_gpu_ids)
@@ -370,13 +362,7 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         envs.VLLM_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cache_key}.json"
     )
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    from vllm.distributed.parallel_state import get_world_group
-
-    if (not is_distributed or get_world_group().local_rank == 0) and (
-        not os.path.exists(path)
-    ):
-        # only the local master process (with local_rank == 0) can
-        #  enter this block to calculate the cache
+    if not os.path.exists(path):
         logger.info("generating GPU P2P access cache in %s", path)
         cache: dict[str, bool] = {}
         # The probe subprocesses inherit this process's device-control env
@@ -417,19 +403,70 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
                 ) from e
             with open(output_file.name, "rb") as f:
                 result = pickle.load(f)
-        # Cache entries must be keyed by local indices (0..N-1) because
-        # gpu_p2p_access_check() is called with local ranks.
+        # Cache entries use logical indices (0..N-1), never subgroup ranks
+        # or physical device IDs, matching gpu_p2p_access_check() callers.
         id_to_local = {device_id: local for local, device_id in enumerate(ids)}
         for _i, _j, r in zip(batch_src, batch_tgt, result):
             cache[f"{id_to_local[_i]}->{id_to_local[_j]}"] = r
-        with open(path, "w") as f:
-            json.dump(cache, f, indent=4)
-    if is_distributed:
-        get_world_group().barrier()
+        # Separate PP groups may initialize the same mapping concurrently.
+        # Publish a complete file so another group never reads partial JSON.
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=os.path.dirname(path), delete=False
+            ) as f:
+                temporary_path = f.name
+                json.dump(cache, f, indent=4)
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        return cache
     logger.info("reading GPU P2P access cache from %s", path)
     with open(path) as f:
-        cache = json.load(f)
-    _gpu_p2p_access_cache = cache
+        return json.load(f)
+
+
+def gpu_p2p_access_check(
+    src: int, tgt: int, *, group: dist.ProcessGroup | None = None
+) -> bool:
+    """Check logical GPU indices, optionally initializing within a CPU group.
+
+    `group` callers must agree on the ordered logical-to-physical mapping.
+    Every group member must enter this initialization call, including members
+    with a populated local cache. The leader broadcasts either the complete
+    cache or its probe error; failures cannot leave peers waiting at a barrier.
+    Subsequent calls without `group` use the populated cache locally.
+    """
+    global _gpu_p2p_access_cache
+    if group is not None:
+        result: list[Any] = [None]
+        if dist.get_rank(group=group) == 0:
+            try:
+                cache = _gpu_p2p_access_cache
+                if cache is None:
+                    cache = _read_or_generate_gpu_p2p_access_cache()
+                result[0] = (cache, None)
+            except Exception as error:
+                result[0] = (None, str(error))
+        dist.broadcast_object_list(
+            result, src=dist.get_global_rank(group, 0), group=group
+        )
+        cache, error_message = result[0]
+        if error_message is not None:
+            raise RuntimeError(f"GPU P2P cache initialization failed: {error_message}")
+        _gpu_p2p_access_cache = cache
+    elif _gpu_p2p_access_cache is None:
+        # Preserve the existing world-scoped API for non-communicator callers.
+        from vllm.distributed.parallel_state import get_world_group
+
+        is_distributed = dist.is_initialized()
+        if not is_distributed or get_world_group().local_rank == 0:
+            _gpu_p2p_access_cache = _read_or_generate_gpu_p2p_access_cache()
+        if is_distributed:
+            get_world_group().barrier()
+        if _gpu_p2p_access_cache is None:
+            _gpu_p2p_access_cache = _read_or_generate_gpu_p2p_access_cache()
     return _gpu_p2p_access_cache[f"{src}->{tgt}"]
 
 
