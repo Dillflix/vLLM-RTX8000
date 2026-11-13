@@ -127,6 +127,7 @@
     "CUDA_VISIBLE_DEVICES": "0,1,2,3",
     "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "VLLM_USE_RUST_FRONTEND": "0",
     "VLLM_PP_LAYER_PARTITION": "24,21",
     "OMP_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
@@ -137,7 +138,18 @@
   "api_flags": {
     "reasoning_parser": "glm47",
     "tool_call_parser": "glm47",
-    "enable_auto_tool_choice": true
+    "enable_auto_tool_choice": true,
+    "default_chat_template_kwargs": {
+      "reasoning_effort": "low",
+      "clear_thinking": true
+    },
+    "override_generation_config": {
+      "temperature": 1.0,
+      "top_p": 0.95
+    },
+    "enable_prompt_tokens_details": true,
+    "enable_per_request_metrics": true,
+    "trust_request_mm_kwargs": true
   },
   "limits": [
     "Replace model paths and CPU affinity with the local installation; install the pinned Turing compiler first.",

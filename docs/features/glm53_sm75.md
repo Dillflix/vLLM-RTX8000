@@ -81,6 +81,60 @@ foreign current devices, independent streams and changed-input graph replay.
 Use a fresh output directory and idle GPUs. The CPU codec regression is
 `tests/kernels/core/test_glm_packed_dense.py`.
 
+## API serving profile
+
+Use the Python frontend (`VLLM_USE_RUST_FRONTEND=0`) with `glm47` for both
+reasoning and tool parsing, and enable automatic tool choice. In this source
+revision, `glm45` and `glm47` resolve to the same reasoning adapter. Responses
+use `message.reasoning` and streaming `delta.reasoning`; final answers belong
+in `content`. A simple answer may legitimately have no reasoning text.
+
+The API defaults in the example profile set `reasoning_effort` to `low` and
+`clear_thinking` to true through `default_chat_template_kwargs`. Request-level
+`chat_template_kwargs` can override them. Clearing removes prior reasoning
+from the rendered conversation while retaining prior final answers and tool
+messages. Clients should preserve conversation roles and tool-call identifiers.
+
+The pinned checkpoint template recognizes `low` and `high`; other effort
+values select its deepest `max` mode. With the service defaults, omission uses
+`low`. Do not use `enable_thinking` to control this always-thinking template.
+The current GLM parser handles false thinking toggles without disabling
+reasoning extraction, but these are not a supported way to request less work.
+
+For example:
+
+```json
+{
+  "model": "GLM-5.3-Flash",
+  "messages": [{"role": "user", "content": "Explain the result."}],
+  "max_tokens": 2000,
+  "chat_template_kwargs": {"reasoning_effort": "low", "clear_thinking": true}
+}
+```
+
+Output budgets cover both reasoning and the final answer. A response ending
+with `finish_reason="length"` can have empty final content if reasoning used
+the budget. Retry with enough budget and the original history instead of
+appending an empty assistant turn. For deepest reasoning, 6000 or more output
+tokens is a starting budget, not a completion guarantee. The profile does not
+impose an additional global output-token cap.
+
+Images retain native processor defaults. The trusted, authenticated LAN
+profile enables request processor overrides, so clients may explicitly set
+`mm_processor_kwargs.max_image_tokens`, for example to 1024. This trades image
+detail for fewer tokens; it is not the service default. Video remains disabled.
+Do not copy video sampling advice from another build into this images-only
+profile. Store the API credential outside the repository in a protected
+environment file, and pass it as a bearer token.
+
+The API flags supplement the qualified engine configuration: TP2/PP2, per-rank
+CPU and memory NUMA binding, separately quantized MTP2 with local draft argmax,
+prefix caching and asynchronous scheduling remain enabled. A bare speculative
+method name does not supply the quantized draft artifact or its qualified
+settings. Freeze the source, native extensions, compiler, dependencies and
+configuration together before deployment; retain the previous service for
+rollback.
+
 ## Prefill throughput versus prompt length
 
 The published packed-dense implementation (`04afa5a54`) was measured at
