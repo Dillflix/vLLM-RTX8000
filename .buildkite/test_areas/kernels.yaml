@@ -43,6 +43,9 @@ steps:
   - vllm/kernels/triton/
   - vllm/models/glm5next/nvidia/ops/embedding12_codec.py
   - vllm/models/glm5next/nvidia/ops/embedding_lossless_sm75.py
+  - vllm/models/glm5next/nvidia/ops/packed_dense_codec.py
+  - vllm/models/glm5next/nvidia/ops/arithmetic12_codec.py
+  - vllm/models/glm5next/nvidia/ops/arithmetic12_planes.py
   - tests/kernels/test_concat_mla_q.py
   - tests/kernels/test_fused_qk_norm_rope_gate.py
   - vllm/model_executor/layers/fused_qk_norm_rope.py

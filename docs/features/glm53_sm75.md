@@ -8,9 +8,82 @@ checks below. This establishes the tested behavior, not broad model-quality
 equivalence or a production soak test. Earlier experimental results are retained
 in the later sections.
 
-## Current profile: MTP2, images and 512K input
+## Lossless dense packing and 576K input
 
-The selected profile now supports one **524,288-token input plus 1,024 output
+The opt-in `glm_sm75_lossless_dense` path packs 158 target attention-projection
+shards into shared GPU allocations. Each group uses an exact 12-bit encoding
+where possible and retains raw FP16 words for exceptions. The kernels decode
+weights while computing; they do not materialize a full FP16 weight matrix
+during inference. This is lossless storage, not another quantization step.
+The existing packed embedding and output head remain enabled.
+
+Native single-row execution, split-K verification kernels, and measured
+prefill tile choices retain FP32 accumulation. Shared payload and metadata
+banks avoid oversized per-layer allocator blocks under the loader's allocation
+policy. The measured allocated-memory reduction is **694/694/564/560 MiB**
+on GPUs 0/1/2/3. The kernels share approximately 6.14 MiB of split-K scratch
+per GPU in the tested two-stream worker configuration.
+
+The qualified profile allocates **3,996,319,744 KV bytes/GPU**, 289 hybrid-cache
+blocks, for **589,824 input plus 1,024 output tokens**. TP2/PP2, partition
+`24,21`, 200 W, W4A16 group-128 experts, MTP2, local draft argmax, images,
+prefix caching and asynchronous scheduling are retained. This is a shared
+pool; it does not hold five independent requests of this length. Four native
+images and full-length text are separate qualification workloads.
+
+The preceding dense-packing comparison used three warm repetitions with
+8192 input and 128 output tokens per user, clearing prefix reuse before each
+timed request. Its baseline predates the native FP8-key indexer extension
+described below. Prefill remained within 0.2% of that baseline. Median
+single-user decode changed from 65.6 to 69.2 output tokens/s; five-user
+aggregate decode changed from 159.3 to 165.8 output tokens/s (31.9 to 33.2
+on average per user). Five-user decode is measured only during the common
+frontend interval after every request begins output and before any finishes;
+those roughly 1.3–1.6-second windows are variable. These are not rates that
+include prefill, or a claim that every intermediate kernel shape improved.
+
+The prior 576K capacity gate completed cold and reused-prefix retrieval with
+1024 forced output tokens, all five standard feature checks, four native
+images, MTP verification and six functional checks. It observed no allocator
+retries or OOMs. Loaded weight hashes matched the independent ledger for all
+158 shards. Floating-point reduction order changes, so bitwise model-output
+equivalence and broad quality equivalence are not claimed.
+
+The combined current-main implementation, including native FP8-key indexer
+scoring and the rebuilt CMake extension, passed the same 576K cold/reused
+capacity, five feature, four-native-image, MTP/head and six functional
+checks. Cold first-token latency was 434.87 seconds
+(1356 effective input tokens/s).
+Prefix reuse retained 589,696 tokens and reduced first-token
+latency to 0.97 seconds. There were no allocator
+retries, OOMs or new GPU PCIe errors. This remains bounded qualification,
+not a production service deployment or sustained-load guarantee.
+The [measurement record](../../benchmarks/kernels/results/glm53_sm75_packed_dense.json)
+separates the earlier dense comparison from the combined-main result.
+
+Rebuild `_rtx8000_C` from this source: both the normal and standalone CMake
+builds install `libglm_packed_dense.so` alongside its Python adapter. The
+option defaults to false and requires `glm_native_dense`, SM75, FP16, TP2/PP2,
+GLM hidden size 4096, compilation mode 0 and the automatic linear backend.
+LoRA, offload, direct weight reload, sleep, DBO and batch-invariant execution
+are rejected. The model's existing quantization and kernel defaults are
+unchanged when the option is off.
+
+For the four-GPU component gate after installation:
+
+```bash
+.venv/bin/python benchmarks/kernels/qualify_glm_packed_dense_sm75.py \
+  --output /tmp/glm-packed-dense-check
+```
+
+The gate exercises all compiled variants, mixed raw/packed groups, tails,
+foreign current devices, independent streams and changed-input graph replay.
+Use a fresh output directory and idle GPUs. The CPU codec regression is
+`tests/kernels/core/test_glm_packed_dense.py`.
+
+## Earlier 512K-input native-indexer profile
+
+The earlier profile supported one **524,288-token input plus 1,024 output
 tokens**, with TP2/PP2, partition `24,21`, **200 W/GPU**, group-128 W4A16 experts,
 a separately quantized MTP layer, **two speculative tokens**, local draft argmax,
 prefix caching, images and asynchronous scheduling. Video remains disabled.
@@ -59,7 +132,7 @@ allocation retries or OOMs in the final run. These checks do not establish broad
 model-quality equivalence, long-term hardware stability or a production soak.
 The [compact measurement record](../../benchmarks/kernels/results/glm53_sm75_native_indexer.json)
 preserves the timings and their limitations. The sections below retain earlier
-qualification history; they do not override this current profile.
+qualification history; they do not override the 576K profile above.
 
 ## Earlier images, MTP1 and 384K shared-cache profile
 

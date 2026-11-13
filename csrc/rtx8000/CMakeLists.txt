@@ -31,3 +31,4 @@ target_compile_options(_rtx8000_C PRIVATE -O3 $<$<COMPILE_LANGUAGE:CUDA>:--expt-
 target_compile_definitions(_rtx8000_C PRIVATE Py_LIMITED_API=0x03090000)
 install(TARGETS _rtx8000_C LIBRARY DESTINATION vllm COMPONENT _rtx8000_C)
 include("${CMAKE_CURRENT_LIST_DIR}/native_indexer.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/packed_dense/packed_dense.cmake")

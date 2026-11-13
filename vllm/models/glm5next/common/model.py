@@ -1232,6 +1232,12 @@ class Glm5NextForCausalLM(
 
             self.glm_sm75_lossless_head = validate_lossless_head(vllm_config)
         self.glm_lossless_head_installed: list[dict] = []
+        from vllm.models.glm5next.nvidia.ops.packed_dense_sm75 import (
+            validate_configuration as validate_packed_dense,
+        )
+
+        self.glm_sm75_lossless_dense = validate_packed_dense(vllm_config)
+        self.glm_lossless_dense_installed: list[dict] = []
         if self.glm_native_dense:
             from vllm.models.glm5next.nvidia.ops.dense_sm75 import (
                 validate_configuration,
@@ -1356,6 +1362,12 @@ class Glm5NextForCausalLM(
             )
 
             self.glm_lossless_head_installed = install_lossless_head(self)
+        if self.glm_sm75_lossless_dense:
+            from vllm.models.glm5next.nvidia.ops.packed_dense_sm75 import (
+                install as install_packed_dense,
+            )
+
+            self.glm_lossless_dense_installed = install_packed_dense(self)
 
 
 @MULTIMODAL_REGISTRY.register_processor(

@@ -1,0 +1,441 @@
+{
+  "status": "PASS_PACKAGED_DENSE_WITH_MAIN_NATIVE_FP8_INDEXER_576K",
+  "dense_comparison_baseline": "Preceding native FP16-key indexer; main subsequently added native FP8-key arithmetic. These comparisons isolate dense packing on the earlier baseline.",
+  "tp": 2,
+  "pp": 2,
+  "power_watts_per_gpu": 200,
+  "mtp_tokens": 2,
+  "prefill_budget": 512,
+  "images": true,
+  "prefix_cache": true,
+  "memory": [
+    {
+      "rank": 0,
+      "packing_allocated_memory_reduction_mib": 693.83935546875,
+      "logical_weight_storage_reduction_mib": 669.1054077148438,
+      "shared_split_workspace_mib": 6.140625,
+      "larger_cache_min_sampled_cuda_free_mib": 370.5625,
+      "larger_cache_usable_cuda_total_mib": 48416.4375,
+      "larger_cache_final_allocator_counters": {
+        "num_alloc_retries": 0,
+        "num_ooms": 0
+      }
+    },
+    {
+      "rank": 1,
+      "packing_allocated_memory_reduction_mib": 693.83935546875,
+      "logical_weight_storage_reduction_mib": 669.1054077148438,
+      "shared_split_workspace_mib": 6.140625,
+      "larger_cache_min_sampled_cuda_free_mib": 373.75,
+      "larger_cache_usable_cuda_total_mib": 48418.6875,
+      "larger_cache_final_allocator_counters": {
+        "num_alloc_retries": 0,
+        "num_ooms": 0
+      }
+    },
+    {
+      "rank": 2,
+      "packing_allocated_memory_reduction_mib": 563.841796875,
+      "logical_weight_storage_reduction_mib": 542.045166015625,
+      "shared_split_workspace_mib": 6.140625,
+      "larger_cache_min_sampled_cuda_free_mib": 177.75,
+      "larger_cache_usable_cuda_total_mib": 48418.6875,
+      "larger_cache_final_allocator_counters": {
+        "num_alloc_retries": 0,
+        "num_ooms": 0
+      }
+    },
+    {
+      "rank": 3,
+      "packing_allocated_memory_reduction_mib": 559.841796875,
+      "logical_weight_storage_reduction_mib": 538.545166015625,
+      "shared_split_workspace_mib": 6.140625,
+      "larger_cache_min_sampled_cuda_free_mib": 173.75,
+      "larger_cache_usable_cuda_total_mib": 48418.6875,
+      "larger_cache_final_allocator_counters": {
+        "num_alloc_retries": 0,
+        "num_ooms": 0
+      }
+    }
+  ],
+  "matched_three_warm_repeat_summary": [
+    {
+      "input_tokens_each": 8192,
+      "users": 1,
+      "warm_repeats": 3,
+      "metrics": {
+        "effective_uncached_input_tps": {
+          "control_median": 2087.1641768497075,
+          "candidate_median": 2083.4385707778224,
+          "candidate_change_percent": -0.17850086319075587,
+          "control_range": [
+            2079.269914113526,
+            2090.481673150177
+          ],
+          "candidate_range": [
+            2080.274816815863,
+            2085.9486165559624
+          ]
+        },
+        "ttft_mean_seconds": {
+          "control_median": 3.924942796002142,
+          "candidate_median": 3.931961381007568,
+          "candidate_change_percent": 0.17882005853882,
+          "control_range": [
+            3.918714095998439,
+            3.9398444350081263
+          ],
+          "candidate_range": [
+            3.9272300070006168,
+            3.9379412440030137
+          ]
+        },
+        "output_tps_including_prefill": {
+          "control_median": 21.786363474252276,
+          "candidate_median": 22.173800201411716,
+          "candidate_change_percent": 1.778345099297196,
+          "control_range": [
+            21.55923408179729,
+            21.860060362943408
+          ],
+          "candidate_range": [
+            22.084313765020067,
+            22.342303371455003
+          ]
+        },
+        "per_request_decode_tps_mean": {
+          "control_median": 65.5755818234259,
+          "candidate_median": 69.22388966739354,
+          "candidate_change_percent": 5.563515782126571,
+          "control_range": [
+            63.11569657093396,
+            65.62018590989074
+          ],
+          "candidate_range": [
+            67.9606691658525,
+            70.67069700578519
+          ]
+        },
+        "common_window_decode_tps_total": {
+          "control_median": 65.5755818234259,
+          "candidate_median": 69.22388966739354,
+          "candidate_change_percent": 5.563515782126571,
+          "control_range": [
+            63.11569657093396,
+            65.62018590989074
+          ],
+          "candidate_range": [
+            67.9606691658525,
+            70.67069700578519
+          ]
+        },
+        "common_window_decode_tps_per_user_mean": {
+          "control_median": 65.5755818234259,
+          "candidate_median": 69.22388966739354,
+          "candidate_change_percent": 5.563515782126571,
+          "control_range": [
+            63.11569657093396,
+            65.62018590989074
+          ],
+          "candidate_range": [
+            67.9606691658525,
+            70.67069700578519
+          ]
+        }
+      }
+    },
+    {
+      "input_tokens_each": 8192,
+      "users": 5,
+      "warm_repeats": 3,
+      "metrics": {
+        "effective_uncached_input_tps": {
+          "control_median": 2212.3770834654247,
+          "candidate_median": 2211.247363672641,
+          "candidate_change_percent": -0.05106361845939045,
+          "control_range": [
+            2204.1686394819835,
+            2224.391325741726
+          ],
+          "candidate_range": [
+            2204.029523638323,
+            2219.4228560567617
+          ]
+        },
+        "ttft_mean_seconds": {
+          "control_median": 11.416461758999503,
+          "candidate_median": 11.418324753604248,
+          "candidate_change_percent": 0.016318493803701983,
+          "control_range": [
+            11.351237265797682,
+            11.46234745279944
+          ],
+          "candidate_range": [
+            11.371525591003593,
+            11.46228805539722
+          ]
+        },
+        "output_tps_including_prefill": {
+          "control_median": 29.060615409808587,
+          "candidate_median": 29.268442868406737,
+          "candidate_change_percent": 0.7151516086889353,
+          "control_range": [
+            29.01606991355444,
+            29.085408013012998
+          ],
+          "candidate_range": [
+            29.096113983648902,
+            29.506040717630214
+          ]
+        },
+        "per_request_decode_tps_mean": {
+          "control_median": 17.608865594729313,
+          "candidate_median": 17.901132594696925,
+          "candidate_change_percent": 1.659771882494776,
+          "control_range": [
+            17.495655947692118,
+            17.755963159928807
+          ],
+          "candidate_range": [
+            17.847262869490148,
+            18.5470414408218
+          ]
+        },
+        "common_window_decode_tps_total": {
+          "control_median": 159.31290000897002,
+          "candidate_median": 165.84324749737212,
+          "candidate_change_percent": 4.099070124286497,
+          "control_range": [
+            159.25621613899017,
+            164.41821552584958
+          ],
+          "candidate_range": [
+            157.81884757207294,
+            175.54238868728132
+          ]
+        },
+        "common_window_decode_tps_per_user_mean": {
+          "control_median": 31.862580001794004,
+          "candidate_median": 33.16864949947442,
+          "candidate_change_percent": 4.099070124286475,
+          "control_range": [
+            31.851243227798033,
+            32.88364310516992
+          ],
+          "candidate_range": [
+            31.563769514414588,
+            35.10847773745626
+          ]
+        }
+      }
+    },
+    {
+      "input_tokens_each": 32768,
+      "users": 1,
+      "warm_repeats": 3,
+      "metrics": {
+        "effective_uncached_input_tps": {
+          "control_median": 2128.361863567442,
+          "candidate_median": 2125.7210237968698,
+          "candidate_change_percent": -0.12407851389264479,
+          "control_range": [
+            2123.0963626961,
+            2131.13688903057
+          ],
+          "candidate_range": [
+            2123.4896267569584,
+            2128.717275197843
+          ]
+        },
+        "ttft_mean_seconds": {
+          "control_median": 15.39587819200824,
+          "candidate_median": 15.415004901005886,
+          "candidate_change_percent": 0.1242326599308452,
+          "control_range": [
+            15.375830698001664,
+            15.434061578998808
+          ],
+          "candidate_range": [
+            15.393307688995264,
+            15.431203235988505
+          ]
+        },
+        "output_tps_including_prefill": {
+          "control_median": 7.405383120218219,
+          "candidate_median": 7.417494213542374,
+          "candidate_change_percent": 0.16354445310315935,
+          "control_range": [
+            7.372504612970775,
+            7.415657138003617
+          ],
+          "candidate_range": [
+            7.377861720925013,
+            7.46722139216405
+          ]
+        },
+        "per_request_decode_tps_mean": {
+          "control_median": 67.37634056546426,
+          "candidate_median": 69.57811187998357,
+          "candidate_change_percent": 3.267870139637541,
+          "control_range": [
+            64.6010192676753,
+            68.62448670906925
+          ],
+          "candidate_range": [
+            65.66073809301713,
+            72.64342916822979
+          ]
+        },
+        "common_window_decode_tps_total": {
+          "control_median": 67.37634056546426,
+          "candidate_median": 69.57811187998357,
+          "candidate_change_percent": 3.267870139637541,
+          "control_range": [
+            64.6010192676753,
+            68.62448670906925
+          ],
+          "candidate_range": [
+            65.66073809301713,
+            72.64342916822979
+          ]
+        },
+        "common_window_decode_tps_per_user_mean": {
+          "control_median": 67.37634056546426,
+          "candidate_median": 69.57811187998357,
+          "candidate_change_percent": 3.267870139637541,
+          "control_range": [
+            64.6010192676753,
+            68.62448670906925
+          ],
+          "candidate_range": [
+            65.66073809301713,
+            72.64342916822979
+          ]
+        }
+      }
+    }
+  ],
+  "prior_capacity": {
+    "input_tokens": 589824,
+    "output_tokens": 1024,
+    "cache_blocks": 289,
+    "blocks_required_for_long_request": 285,
+    "usable_blocks_after_null_and_watermark": 288,
+    "extra_kv_mib_per_gpu": 395.625,
+    "mtp_tokens": 2,
+    "local_draft_argmax": true,
+    "prefix_caching": true,
+    "vision_enabled": true,
+    "async_scheduling": true,
+    "four_image_test_tokens": 32037,
+    "image_tokens_each": 8000,
+    "four_image_test_passed": true,
+    "phases": [
+      {
+        "prefix_state": "cold",
+        "wall_seconds": 496.44719167999574,
+        "num_cached_tokens": 0,
+        "observed_ttft_seconds": 482.27146867499687,
+        "effective_uncached_input_tokens_per_second": 1223.0124282916743,
+        "retrieval_in_first_64_tokens": true
+      },
+      {
+        "prefix_state": "reused",
+        "wall_seconds": 15.165751567008556,
+        "num_cached_tokens": 589696,
+        "observed_ttft_seconds": 0.987254813007894,
+        "effective_uncached_input_tokens_per_second": 129.65244465106144,
+        "retrieval_in_first_64_tokens": true
+      }
+    ],
+    "cold_and_reused_output_tokens_identical": true,
+    "scope": "Shared cache pool. One 589824-token input plus 1024 output tested; not five independent requests of this length. Four-image request tested separately with the same fully loaded configuration."
+  },
+  "quality": {
+    "source_weight_hashes_verified": 158,
+    "new_weight_quantization": false,
+    "functional_checks_passed": 6,
+    "standard_feature_checks_passed": 5,
+    "four_native_images_and_long_context_retrieval": "PASS",
+    "limitation": "Bit-exact loaded-weight reconstruction; changed floating-point reduction order. Spot checks do not establish broad quality equivalence."
+  },
+  "limits": [
+    "Performance is specific to the tested 512-token prefill profile; intermediate component batches including 96/128/384 retain some regressions.",
+    "Five-user decode is the frontend-observed interval after all five have started and before any finishes; about 1.3-1.6 seconds per repeat.",
+    "Prefill is effective uncached input tokens divided by first-output latency, not isolated GPU prefill-kernel timing.",
+    "The enlarged profile has one warm timing repeat, plus cold and reused full-length capacity checks; it is not a long-duration service soak.",
+    "Forced 1024-token capacity tails are allocation checks, not open-ended generation quality or representative decode benchmarks."
+  ],
+  "prior_archive_sha256": "d5151591425100538cf6a65ffb89e5016afa9dc939a4610601fc4a4e02bfd10b",
+  "combined_main": {
+    "base_commit": "4bad40d29cc2579a594470fe587b660af6a3554c",
+    "report_sha256": "4c95c6b0fd63aaf2859d08e54a83511b09f18b30a7411aa81b655eec34d0219b",
+    "guard_sha256": "c5ef9a96537bd015e4a1229b31a4459bd3dfff88524c42eb487f483576f0f173",
+    "standard_feature_checks": 5,
+    "functional_checks": 6,
+    "four_native_images": true,
+    "head_global_argmax": true,
+    "capacity": [
+      {
+        "prefix_state": "cold",
+        "num_cached_tokens": 0,
+        "observed_ttft_seconds": 434.8713053770043,
+        "wall_seconds": 448.94402539099974,
+        "effective_uncached_input_tokens_per_second": 1356.318507813851,
+        "retrieval_in_first_64_tokens": true
+      },
+      {
+        "prefix_state": "reused",
+        "num_cached_tokens": 589696,
+        "observed_ttft_seconds": 0.9749951240082737,
+        "wall_seconds": 15.042579476008541,
+        "effective_uncached_input_tokens_per_second": 131.28270782912531,
+        "retrieval_in_first_64_tokens": true
+      }
+    ],
+    "memory": [
+      {
+        "rank": 0,
+        "cuda_free_mib": 370.5625,
+        "peak_allocated_mib": 46715.05517578125,
+        "peak_reserved_mib": 47342.0,
+        "allocator_counters": {
+          "num_alloc_retries": 0,
+          "num_ooms": 0
+        }
+      },
+      {
+        "rank": 1,
+        "cuda_free_mib": 373.75,
+        "peak_allocated_mib": 46715.05517578125,
+        "peak_reserved_mib": 47342.0,
+        "allocator_counters": {
+          "num_alloc_retries": 0,
+          "num_ooms": 0
+        }
+      },
+      {
+        "rank": 2,
+        "cuda_free_mib": 177.75,
+        "peak_allocated_mib": 47424.720703125,
+        "peak_reserved_mib": 47546.0,
+        "allocator_counters": {
+          "num_alloc_retries": 0,
+          "num_ooms": 0
+        }
+      },
+      {
+        "rank": 3,
+        "cuda_free_mib": 173.75,
+        "peak_allocated_mib": 47428.7177734375,
+        "peak_reserved_mib": 47550.0,
+        "allocator_counters": {
+          "num_alloc_retries": 0,
+          "num_ooms": 0
+        }
+      }
+    ],
+    "new_gpu_pcie_errors": false,
+    "scope": "Combined current-main code and packaged extension, 576K + 1024 cold/reused, MTP2/images/prefix; not service-deployed or a broad quality evaluation."
+  }
+}

@@ -1,5 +1,5 @@
 {
-  "status": "Qualified bounded 512K-input profile; not production-deployed or broadly quality-evaluated",
+  "status": "Qualified combined-main 576K-input profile; not production-deployed or broadly quality-evaluated",
   "hardware": "4x Quadro RTX8000, 200 W each; NVLink pairs 0/1 and 2/3 on separate NUMA nodes",
   "checkpoint": "wtdcode/GLM-5.3-Flash-AWQ-W4A16",
   "checkpoint_revision": "abd7b07719111f137e1de8a0c1b7e01c11b74d1a",
@@ -32,7 +32,7 @@
       "10-19,30-39",
       "10-19,30-39"
     ],
-    "max_model_len": 525312,
+    "max_model_len": 590848,
     "max_num_seqs": 5,
     "max_num_batched_tokens": 512,
     "gpu_memory_utilization": 0.96,
@@ -44,7 +44,7 @@
       "draft_tensor_parallel_size": 2,
       "quantization": "compressed-tensors",
       "moe_backend": "marlin",
-      "max_model_len": 525312,
+      "max_model_len": 590848,
       "use_local_argmax_reduction": true,
       "draft_load_config": {
         "load_format": "safetensors",
@@ -106,12 +106,13 @@
       "glm_sm75_mhc_post_workspace": true,
       "glm_sm75_lossless_head": true,
       "glm_sm75_request_gather_bound": true,
-      "glm_sm75_native_topk": true
+      "glm_sm75_native_topk": true,
+      "glm_sm75_lossless_dense": true
     },
     "seed": 17,
     "generation_config": "vllm",
     "disable_log_stats": false,
-    "kv_cache_memory_bytes": 3581476864,
+    "kv_cache_memory_bytes": 3996319744,
     "enable_extensible_kv_cache": false,
     "per_request_spec_decode_metrics": "detailed",
     "mm_encoder_attn_backend": "TORCH_SDPA",
@@ -141,9 +142,10 @@
   "limits": [
     "Replace model paths and CPU affinity with the local installation; install the pinned Turing compiler first.",
     "MTP is a separately converted INT4 group-128 artifact; the unquantized upstream MTP weights do not fit this profile.",
-    "512K means one 524288-token input plus 1024 output tokens, not five such requests at once.",
+    "576K means one 589824-token input plus 1024 output tokens, not five such requests at once.",
     "Four native-resolution images and long text capacity were qualified separately; video is disabled.",
     "The image-count admission ceiling of 999 is not a capacity guarantee.",
-    "The GPU guard observed no new GPU PCIe errors during qualification; long-term hardware stability is not established."
+    "The GPU guard observed no new GPU PCIe errors during qualification; long-term hardware stability is not established.",
+    "Lossless dense packing requires rebuilding the RTX8000 component, including libglm_packed_dense.so; it does not support LoRA, offload, direct weight reload, sleep, DBO or batch-invariant execution."
   ]
 }
