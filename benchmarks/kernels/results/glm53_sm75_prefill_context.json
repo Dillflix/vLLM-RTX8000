@@ -1,0 +1,207 @@
+{
+  "status": "PASS_CURRENT_MAIN_PREFILL_CONTEXT_SWEEP",
+  "source_commit": "04afa5a54fff5c0fff9aa4f1f1f5e60e62038110",
+  "hardware": "4x RTX8000, TP2/PP2, NVLink pairs 0/1 and 2/3, 200 W/GPU",
+  "configuration": {
+    "expert_weights": "W4A16 group-128",
+    "mtp_tokens": 2,
+    "lossless_dense": true,
+    "native_fp8_key_indexer": true,
+    "vision_loaded": true,
+    "workload": "text only",
+    "prefix_cache_enabled": true,
+    "reset_before_each_request": true,
+    "max_num_batched_tokens": 512,
+    "users": 1,
+    "fixed_output_tokens": 128,
+    "max_model_len": 590848,
+    "kv_cache_memory_bytes_per_gpu": 3996319744
+  },
+  "measurement": "Input tokens divided by observed frontend time to first output; includes scheduling and first-token work, excludes prompt rendering/tokenization. Not pure GPU prefill or output/decode throughput.",
+  "warm_repetitions_each": 3,
+  "first_use_runs_reported_separately": true,
+  "rows": [
+    {
+      "input_tokens": 8192,
+      "warm_median_ttft_seconds": 3.928715303991339,
+      "warm_median_input_tps": 2085.159999167519,
+      "warm_range_input_tps": [
+        2084.160630343506,
+        2099.682210461467
+      ],
+      "warm_range_ttft_seconds": [
+        3.901542794992565,
+        3.930599148996407
+      ],
+      "runs": [
+        {
+          "repeat": 0,
+          "warmth": "first_shape_use",
+          "ttft_seconds": 4.88881119400321,
+          "effective_input_tps": 1675.6629935000556,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "ea41c8a179585d328591204d888e49808e76cbc546fbe0a8f129705847b1dd87"
+        },
+        {
+          "repeat": 1,
+          "warmth": "warm_repeat",
+          "ttft_seconds": 3.901542794992565,
+          "effective_input_tps": 2099.682210461467,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "ea41c8a179585d328591204d888e49808e76cbc546fbe0a8f129705847b1dd87"
+        },
+        {
+          "repeat": 2,
+          "warmth": "warm_repeat",
+          "ttft_seconds": 3.930599148996407,
+          "effective_input_tps": 2084.160630343506,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "ea41c8a179585d328591204d888e49808e76cbc546fbe0a8f129705847b1dd87"
+        },
+        {
+          "repeat": 3,
+          "warmth": "warm_repeat",
+          "ttft_seconds": 3.928715303991339,
+          "effective_input_tps": 2085.159999167519,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "ea41c8a179585d328591204d888e49808e76cbc546fbe0a8f129705847b1dd87"
+        }
+      ],
+      "input_tps_change_percent_vs_8k": 0.0,
+      "ttft_ratio_vs_8k": 1.0
+    },
+    {
+      "input_tokens": 32768,
+      "warm_median_ttft_seconds": 15.21913883399975,
+      "warm_median_input_tps": 2153.0784597874795,
+      "warm_range_input_tps": [
+        2147.483997521977,
+        2163.6450879452786
+      ],
+      "warm_range_ttft_seconds": [
+        15.144812882004771,
+        15.258786578997388
+      ],
+      "runs": [
+        {
+          "repeat": 0,
+          "warmth": "first_shape_use",
+          "ttft_seconds": 15.211626766991685,
+          "effective_input_tps": 2154.1417300025128,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "c2afea6fdfabc4583926a59bcd1f4e375f4cfc3032aeb8ba4dcdf94823009d0b"
+        },
+        {
+          "repeat": 1,
+          "warmth": "warm_repeat",
+          "ttft_seconds": 15.144812882004771,
+          "effective_input_tps": 2163.6450879452786,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "c2afea6fdfabc4583926a59bcd1f4e375f4cfc3032aeb8ba4dcdf94823009d0b"
+        },
+        {
+          "repeat": 2,
+          "warmth": "warm_repeat",
+          "ttft_seconds": 15.21913883399975,
+          "effective_input_tps": 2153.0784597874795,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "c2afea6fdfabc4583926a59bcd1f4e375f4cfc3032aeb8ba4dcdf94823009d0b"
+        },
+        {
+          "repeat": 3,
+          "warmth": "warm_repeat",
+          "ttft_seconds": 15.258786578997388,
+          "effective_input_tps": 2147.483997521977,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "c2afea6fdfabc4583926a59bcd1f4e375f4cfc3032aeb8ba4dcdf94823009d0b"
+        }
+      ],
+      "input_tps_change_percent_vs_8k": 3.2572301716451646,
+      "ttft_ratio_vs_8k": 3.8738207419962496
+    },
+    {
+      "input_tokens": 131072,
+      "warm_median_ttft_seconds": 66.73947761200543,
+      "warm_median_input_tps": 1963.9350604749432,
+      "warm_range_input_tps": [
+        1956.3622381525845,
+        1969.0515460761062
+      ],
+      "warm_range_ttft_seconds": [
+        66.5660582940036,
+        66.9978173999989
+      ],
+      "runs": [
+        {
+          "repeat": 0,
+          "warmth": "first_shape_use",
+          "ttft_seconds": 65.86808904900681,
+          "effective_input_tps": 1989.9165421738671,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "b73a95e76bbc55786ab5c333b3cc871da20e176be94cc36981e208242a05a417"
+        },
+        {
+          "repeat": 1,
+          "warmth": "warm_repeat",
+          "ttft_seconds": 66.5660582940036,
+          "effective_input_tps": 1969.0515460761062,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "b73a95e76bbc55786ab5c333b3cc871da20e176be94cc36981e208242a05a417"
+        },
+        {
+          "repeat": 2,
+          "warmth": "warm_repeat",
+          "ttft_seconds": 66.73947761200543,
+          "effective_input_tps": 1963.9350604749432,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "b73a95e76bbc55786ab5c333b3cc871da20e176be94cc36981e208242a05a417"
+        },
+        {
+          "repeat": 3,
+          "warmth": "warm_repeat",
+          "ttft_seconds": 66.9978173999989,
+          "effective_input_tps": 1956.3622381525845,
+          "cached_tokens": 0,
+          "prompt_token_ids_sha256": "b73a95e76bbc55786ab5c333b3cc871da20e176be94cc36981e208242a05a417"
+        }
+      ],
+      "input_tps_change_percent_vs_8k": -5.813699607750666,
+      "ttft_ratio_vs_8k": 16.987608530504136
+    }
+  ],
+  "memory": [
+    {
+      "rank": 0,
+      "allocator_counters": {
+        "num_alloc_retries": 0,
+        "num_ooms": 0
+      }
+    },
+    {
+      "rank": 1,
+      "allocator_counters": {
+        "num_alloc_retries": 0,
+        "num_ooms": 0
+      }
+    },
+    {
+      "rank": 2,
+      "allocator_counters": {
+        "num_alloc_retries": 0,
+        "num_ooms": 0
+      }
+    },
+    {
+      "rank": 3,
+      "allocator_counters": {
+        "num_alloc_retries": 0,
+        "num_ooms": 0
+      }
+    }
+  ],
+  "functional_checks_passed": 6,
+  "new_gpu_pcie_errors": false,
+  "report_sha256": "b543c6e9b00c17fcbad0a026da0799f8ca11802c1d8b03d44d82765c69dc553c",
+  "guard_sha256": "03ff173578688a7e8ba61448c3585c6e4fff988ff14ad44d28057f4e0f7f5fea",
+  "limits": "Sequential single-user synthetic prompts, one engine, three warmed repetitions per length; no simultaneous multi-user load or broad quality evaluation. No per-kernel profiling in these timed runs."
+}

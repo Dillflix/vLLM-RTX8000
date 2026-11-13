@@ -81,6 +81,36 @@ foreign current devices, independent streams and changed-input graph replay.
 Use a fresh output directory and idle GPUs. The CPU codec regression is
 `tests/kernels/core/test_glm_packed_dense.py`.
 
+## Prefill throughput versus prompt length
+
+The published packed-dense implementation (`04afa5a54`) was measured at
+8192, 32768 and 131072 input tokens with one user and 128 output tokens.
+The same 576K-capable cache profile, 512-token prefill budget, 200 W limits,
+TP2/PP2, W4A16 group-128 experts, MTP2, native FP8-key indexer and image
+support remained enabled. The measured prompts were text-only.
+
+Each length had one first-use observation followed by three warm
+repetitions. Warm means initialized kernels; prefix caching was enabled
+but reset before every request, and every request reported zero cached
+tokens. Effective input rate is input tokens divided by observed
+frontend TTFT, including scheduling and first-token work but excluding
+prompt rendering/tokenization. It is separate from decode throughput.
+
+| Input tokens | Median TTFT (s) | Median input tokens/s | Warm input tokens/s range | Change from 8K |
+| ---: | ---: | ---: | ---: | ---: |
+| 8,192 | 3.93 | 2,085.2 | 2,084.2 to 2,099.7 | +0.00% |
+| 32,768 | 15.22 | 2,153.1 | 2,147.5 to 2,163.6 | +3.26% |
+| 131,072 | 66.74 | 1,963.9 | 1,956.4 to 1,969.1 | -5.81% |
+
+The 128K rate was 8.78% lower than the 32K rate. These
+three sequential repetitions establish scaling for this workload; they
+do not identify the per-kernel cause or measure simultaneous multi-user
+load. There were no allocator retries, OOMs or new GPU PCIe errors,
+and the post-run functional and MTP/head checks passed.
+
+The [context-sweep record](../../benchmarks/kernels/results/glm53_sm75_prefill_context.json)
+retains every timing, including first-use results, and source/report hashes.
+
 ## Earlier 512K-input native-indexer profile
 
 The earlier profile supported one **524,288-token input plus 1,024 output
