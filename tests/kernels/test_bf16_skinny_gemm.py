@@ -1548,7 +1548,7 @@ def test_rtx8000_native_dense_variants_and_dispatch(shape, monkeypatch) -> None:
     torch.manual_seed(21)
     n, k = shape
     weight = torch.randn(n, k, device="cuda", dtype=torch.float16) * 0.02
-    for m in (1, 2, 4, 5, 8, 12, 16, 20):
+    for m in (1, 2, 3, 4, 5, 6, 8, 12, 16, 20):
         x = torch.randn(m, k, device="cuda", dtype=torch.float16)
         expected = (x.float() @ weight.float().T).half()
         for variant in range(12 if m <= 16 else 4):
@@ -1560,10 +1560,11 @@ def test_rtx8000_native_dense_variants_and_dispatch(shape, monkeypatch) -> None:
             assert error / rms.clamp_min(1e-12) <= 1e-3
         actual = torch.ops.vllm.qwen4_exp_low_latency_gemm(x, weight)
         torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
-        if m == 12:
-            # Replay must read changed inputs and overwrite every output. This
-            # covers tail N=48/336 as well as the real 124160-column head shard.
-            for variant in range(4, 12):
+        if m in (3, 6, 12):
+            # Include the M3/M6 vector branches and the existing M12 MMA path.
+            # Replay must read changed inputs and overwrite every output.
+            variants = (0, 1) if m in (3, 6) else range(4, 12)
+            for variant in variants:
                 torch.ops._rtx8000_C.dense(x, weight, out, variant)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):

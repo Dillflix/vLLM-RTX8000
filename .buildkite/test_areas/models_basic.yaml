@@ -358,6 +358,7 @@ steps:
   timeout_in_minutes: 20
   device: h200_35gb
   source_file_dependencies:
+  - csrc/rtx8000/
   - vllm/models/glm5next/
   - tests/models/glm5next/
   - vllm/model_executor/layers/mamba/checkpoint.py

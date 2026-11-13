@@ -29,6 +29,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 
 if current_platform.is_rocm():
@@ -39,6 +40,9 @@ if current_platform.is_rocm():
     )
 else:
     from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+        _store_e4m3fn,
+        fwht128_fp16,
+        fwht128_quant_fp8,
         kpool_compress_and_write_cache,
         kpool_decode_update_and_maybe_write_cache_batched,
         kpool_seed_tail_cache,
@@ -51,15 +55,47 @@ NUM_BLOCKS = 32
 ROUND_SCALE = True
 FP8_DTYPE = current_platform.fp8_dtype()
 FP8_MAX = torch.finfo(FP8_DTYPE).max
+POOL_DTYPES = [torch.bfloat16]
+if current_platform.is_cuda():
+    POOL_DTYPES.append(torch.float16)
+POOL_DTYPE_IDS = ["fp16" if dtype == torch.float16 else "bf16" for dtype in POOL_DTYPES]
 
 
-def _make_caches():
+@triton.jit
+def _e4m3fn_byte_store_kernel(x, out, N: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(x + offsets, offsets < N, 0)
+    _store_e4m3fn(out + offsets, values, offsets < N)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA byte-store path")
+def test_software_e4m3fn_store_matches_rounding_boundaries():
+    """SM75's integer encoder must match native E4M3FN round-to-nearest-even."""
+    half = torch.arange(65536, dtype=torch.int32).to(torch.uint16).view(torch.float16)
+    half = half[torch.isfinite(half)].float().clamp(-448, 448)
+    levels = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    mid = (levels[:-1] + levels[1:]) / 2
+    edges = torch.cat(
+        (
+            torch.nextafter(mid, torch.full_like(mid, -float("inf"))),
+            mid,
+            torch.nextafter(mid, torch.full_like(mid, float("inf"))),
+        )
+    )
+    values = torch.cat((half, edges, -edges))
+    expected = values.to(torch.float8_e4m3fn).view(torch.uint8)
+    actual = torch.empty(values.shape, dtype=torch.uint8, device="cuda")
+    _e4m3fn_byte_store_kernel[(triton.cdiv(values.numel(), 256),)](
+        values.cuda(), actual, values.numel(), 256
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+def _make_caches(dtype=torch.bfloat16):
     kv = torch.zeros(
         NUM_BLOCKS, PAGE_SIZE, HEAD_DIM + 4, dtype=torch.uint8, device="cuda"
     )
-    tail = torch.zeros(
-        NUM_BLOCKS, 2, POOL_SIZE, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
-    )
+    tail = torch.zeros(NUM_BLOCKS, 2, POOL_SIZE, HEAD_DIM, dtype=dtype, device="cuda")
     return kv, tail
 
 
@@ -77,7 +113,7 @@ def _seed_prior(tail, blocks, n_prior, seed=42):
         len(blocks),
         n_prior,
         HEAD_DIM,
-        dtype=torch.bfloat16,
+        dtype=tail.dtype,
         device=tail.device,
         generator=g,
     )
@@ -85,7 +121,7 @@ def _seed_prior(tail, blocks, n_prior, seed=42):
         len(blocks),
         n_prior,
         HEAD_DIM,
-        dtype=torch.bfloat16,
+        dtype=tail.dtype,
         device=tail.device,
         generator=g,
     )
@@ -94,15 +130,40 @@ def _seed_prior(tail, blocks, n_prior, seed=42):
         tail[blk, 1, :n_prior, :] = prior_s[i]
 
 
-def _hadamard128_torch(x: torch.Tensor) -> torch.Tensor:
+def _hadamard128_torch(x: torch.Tensor, scale_after: bool = False) -> torch.Tensor:
     """Reference Hadamard-128 on the last dim (must be 128)."""
     n = x.shape[-1]
     assert n == 128
     h = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=torch.float32, device=x.device)
     while h.shape[0] < n:
         h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+    if scale_after:
+        return (x @ h) * (1.0 / math.sqrt(n))
     h = h / math.sqrt(n)
     return x @ h
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="SM75 FP16 query path")
+@pytest.mark.parametrize("rows", [0, 1, 17, 32, 513])
+@pytest.mark.parametrize("quantize", [False, True], ids=["fp16", "fp8"])
+def test_fwht_query_matches_hadamard_matrix(rows, quantize):
+    torch.manual_seed(0)
+    q = torch.randint(-8, 9, (rows, HEAD_DIM), device="cuda").to(torch.float16)
+    # Integer-valued inputs and an unscaled +/-1 matrix have exact FP32 sums.
+    # Applying the scale once avoids GEMM cancellation noise at exact zeros.
+    expected = _hadamard128_torch(q.float(), scale_after=True).half()
+    if quantize:
+        actual, scale = fwht128_quant_fp8(q)
+        rotated = expected.float().cpu()
+        amax = rotated.abs().amax(-1, keepdim=True).clamp(min=1e-4)
+        expected_scale = (amax / 448.0).log2().ceil().exp2()
+        expected_q = (rotated / expected_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        torch.testing.assert_close(scale.cpu(), expected_scale, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual.cpu().view(torch.uint8), expected_q.view(torch.uint8), rtol=0, atol=0
+        )
+    else:
+        torch.testing.assert_close(fwht128_fp16(q), expected, rtol=0, atol=0)
 
 
 def _torch_reference(
@@ -181,8 +242,8 @@ def _torch_reference(
                 prob = torch.exp(pool_scores - max_score)
                 denom = prob.sum(dim=0)
                 acc = (pool_ks * prob).sum(dim=0)
-                x = (acc / denom).to(torch.bfloat16).to(torch.float32)
-                x = _hadamard128_torch(x).to(torch.bfloat16).to(torch.float32)
+                x = (acc / denom).to(tail.dtype).to(torch.float32)
+                x = _hadamard128_torch(x).to(tail.dtype).to(torch.float32)
                 absmax = torch.clamp(x.abs().max(), min=1e-4)
                 if ROUND_SCALE:
                     scale = torch.exp2(torch.ceil(torch.log2(absmax / FP8_MAX)))
@@ -223,7 +284,7 @@ def _torch_reference(
                 tail_cpu[block, 1, phys_slot] = cur_score
 
     kv_out = kv_flat.view(NUM_BLOCKS, PAGE_SIZE, HEAD_DIM + 4).to(device="cuda")
-    return kv_out, tail_cpu.to(torch.bfloat16).to(device="cuda")
+    return kv_out, tail_cpu.to(tail.dtype).to(device="cuda")
 
 
 def _assert_eq(r_ref, r_kern, k_byte_tol=0):
@@ -327,14 +388,15 @@ def _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos):
 
 @pytest.mark.parametrize("pool_size", [4, 16])
 @pytest.mark.parametrize("ring_pools", [1, 2])
-def test_decode_writer_matches_prefill_writer(pool_size, ring_pools):
+@pytest.mark.parametrize("dtype", POOL_DTYPES, ids=POOL_DTYPE_IDS)
+def test_decode_writer_matches_prefill_writer(pool_size, ring_pools, dtype):
     ring = ring_pools * pool_size
     n_pools, page, nblk = 8, 64, 4
     n_tok = n_pools * pool_size
     dev = "cuda"
     torch.manual_seed(0)
-    k = torch.randn(n_tok, HEAD_DIM, dtype=torch.bfloat16, device=dev)
-    score = torch.randn(n_tok, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    k = torch.randn(n_tok, HEAD_DIM, dtype=dtype, device=dev)
+    score = torch.randn(n_tok, HEAD_DIM, dtype=dtype, device=dev)
     ape = torch.randn(pool_size, HEAD_DIM, dtype=torch.float32, device=dev)
 
     kv_prefill = torch.zeros(nblk, page, HEAD_DIM + 4, dtype=torch.uint8, device=dev)
@@ -351,7 +413,7 @@ def test_decode_writer_matches_prefill_writer(pool_size, ring_pools):
 
     # One request owning tail block 0, fed one token per decode step.
     kv_decode = torch.zeros_like(kv_prefill)
-    tail = torch.zeros(nblk, 2, ring, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    tail = torch.zeros(nblk, 2, ring, HEAD_DIM, dtype=dtype, device=dev)
     for t in range(n_tok):
         completes = t % pool_size == pool_size - 1
         kpool_decode_update_and_maybe_write_cache_batched(
@@ -496,7 +558,8 @@ def test_leading_invalid_tail_slot():
     _assert_eq(r_ref, r_kern)
 
 
-def test_prefill_seed_honors_padded_tail_block_stride():
+@pytest.mark.parametrize("dtype", POOL_DTYPES, ids=POOL_DTYPE_IDS)
+def test_prefill_seed_honors_padded_tail_block_stride(dtype):
     """The tail shares a padded indexer allocation in production.
 
     `get_kv_cache_config_from_groups` aliases each tail tensor onto its
@@ -514,7 +577,7 @@ def test_prefill_seed_honors_padded_tail_block_stride():
     backing = torch.full(
         (num_blocks * padded_block_elems,),
         sentinel,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device="cuda",
     )
     tail = torch.as_strided(
@@ -525,8 +588,8 @@ def test_prefill_seed_honors_padded_tail_block_stride():
 
     block = 3
     ring_slot = 2
-    key = torch.arange(HEAD_DIM, dtype=torch.bfloat16, device="cuda").unsqueeze(0)
-    score = (key + 256).to(torch.bfloat16)
+    key = torch.arange(HEAD_DIM, dtype=dtype, device="cuda").unsqueeze(0)
+    score = (key + 256).to(dtype)
     tail_slot = torch.tensor(
         [block * kpool + ring_slot], dtype=torch.int32, device="cuda"
     )
@@ -551,7 +614,8 @@ def test_prefill_seed_honors_padded_tail_block_stride():
         "plain_decode",
     ],
 )
-def test_batched_matches_reference(case_id):
+@pytest.mark.parametrize("dtype", POOL_DTYPES, ids=POOL_DTYPE_IDS)
+def test_batched_matches_reference(case_id, dtype):
     torch.manual_seed(0)
     if case_id == "no_completion":
         B, next_n, blocks = 3, 4, [0, 1, 2]
@@ -601,11 +665,11 @@ def test_batched_matches_reference(case_id):
     else:
         tail_slot = _tail_slot_for(blocks, pos)
 
-    key = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    score = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    key = torch.randn(B, next_n, HEAD_DIM, dtype=dtype, device="cuda")
+    score = torch.randn(B, next_n, HEAD_DIM, dtype=dtype, device="cuda")
     ape = torch.randn(POOL_SIZE, HEAD_DIM, dtype=torch.float32, device="cuda")
 
-    kv, tail = _make_caches()
+    kv, tail = _make_caches(dtype)
     _seed_prior(tail, blocks, n_prior)
     r_ref = _torch_reference(kv, tail, tail_slot, key, score, ape, slot_map, pos)
     r_kern = _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos)

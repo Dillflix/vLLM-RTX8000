@@ -166,3 +166,103 @@ def test_embedding_optionally_reduces_output(dtype, use_fused, default_vllm_conf
                     atol=0,
                     rtol=0,
                 )
+
+
+def test_glm_lossless_dictionary_preserves_all_indices_and_rejects_overflow():
+    """Storage is a bit bijection, including signed zeros and NaN payloads."""
+    import numpy as np
+
+    from vllm.models.glm5next.nvidia.ops.embedding12_codec import (
+        make_dictionary,
+        pack_rows,
+        unpack_rows,
+    )
+
+    special = np.array([0, 0x8000, 0x7C00, 0xFC00, 0x7E01, 0xFE55], dtype=np.uint16)
+    alphabet = np.concatenate(
+        [special, np.setdiff1d(np.arange(4096, dtype=np.uint16) * 16, special)[:4090]]
+    )
+    assert np.unique(alphabet).size == 4096
+    bits = np.tile(alphabet, (2, 1))
+    dictionary = make_dictionary(bits)
+    packed = pack_rows(bits, dictionary)
+    assert packed.shape == (2, 6144)
+    assert np.array_equal(unpack_rows(packed, dictionary), bits)
+    with pytest.raises(ValueError, match="distinct"):
+        make_dictionary(np.arange(4097, dtype=np.uint16))
+
+
+def test_glm_lossless_embedding_rejects_shared_head_before_mutation():
+    """Input storage cannot be compressed while the output head aliases it."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    from vllm.models.glm5next.nvidia.ops.embedding_lossless_sm75 import (
+        LosslessVocabParallelEmbedding,
+        install,
+    )
+
+    with torch.device("cpu"):
+        embedding = LosslessVocabParallelEmbedding(
+            128, 4096, params_dtype=torch.float16, disable_tp=True
+        )
+        head = ParallelLMHead(128, 4096, params_dtype=torch.float16, disable_tp=True)
+    model = torch.nn.Module()
+    model.add_module("embed_tokens", embedding)
+    model.add_module("lm_head", head)
+    head.weight = embedding.weight
+    original = embedding.weight
+    with pytest.raises(ValueError, match="shared"):
+        install(model)
+    assert embedding.weight is head.weight is original
+    assert not hasattr(embedding, "lossless_codes")
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA lookup kernel")
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_glm_lossless_lookup_keeps_bits_and_updates_graph_ids(id_dtype):
+    """Raw lookup preserves stored words and vocabulary masks during replay."""
+    import numpy as np
+
+    from vllm.models.glm5next.nvidia.ops.embedding12_codec import (
+        make_dictionary,
+        pack_rows,
+    )
+    from vllm.models.glm5next.nvidia.ops.embedding_lossless_sm75 import lookup12
+
+    special = np.array([0, 0x8000, 0x7C00, 0xFC00, 0x7E01, 0xFE55], dtype=np.uint16)
+    alphabet = np.concatenate(
+        [special, np.setdiff1d(np.arange(4096, dtype=np.uint16) * 16, special)[:4090]]
+    )
+    assert np.unique(alphabet).size == 4096
+    indices = np.arange(8 * 4096).reshape(8, 4096)
+    bits = alphabet[(indices + np.arange(8)[:, None] * 37) % len(alphabet)]
+    dictionary = make_dictionary(bits)
+    packed = torch.from_numpy(pack_rows(bits, dictionary)).cuda()
+    words = torch.from_numpy(dictionary).cuda()
+    ids = torch.tensor([[20, 21, 23], [24, 40, 42]], dtype=id_dtype, device="cuda")
+
+    def lookup():
+        # Four original rows, two padding rows, then two added vocabulary rows.
+        return lookup12(ids, packed, words, 4096, 20, 24, 2, 40, 42)
+
+    def check(output):
+        expected = np.zeros((*ids.shape, 4096), dtype=np.uint16)
+        for position, token in np.ndenumerate(ids.cpu().numpy()):
+            if 20 <= token < 24:
+                expected[position] = bits[token - 20]
+            elif 40 <= token < 42:
+                expected[position] = bits[token - 40 + 6]
+        actual = output.cpu().view(torch.uint16).numpy()
+        assert np.array_equal(actual, expected)
+
+    check(lookup())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = lookup()
+    for updated in ([[23, 22, 20], [41, -1, 40]], [[24, 20, 41], [42, 21, 23]]):
+        ids.copy_(torch.tensor(updated, device="cuda", dtype=id_dtype))
+        graph.replay()
+        check(output)
+    empty = lookup12(ids[:0], packed, words, 4096, 20, 24, 2, 40, 42)
+    assert empty.shape == (0, 3, 4096)
+    torch.accelerator.synchronize()

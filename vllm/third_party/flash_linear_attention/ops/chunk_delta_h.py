@@ -292,6 +292,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     use_exp2: bool = False,
+    h_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -310,7 +311,31 @@ def chunk_gated_delta_rule_fwd_h(
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    if h_out is None:
+        h = k.new_empty(B, NT, H, V, K)
+    else:
+        if (
+            h_out.shape != (B, NT, H, V, K)
+            or h_out.dtype != k.dtype
+            or h_out.device != k.device
+            or not h_out.is_contiguous()
+            or any(
+                value is not None and torch._C._overlaps(h_out, value)
+                for value in (
+                    k,
+                    w,
+                    u,
+                    g,
+                    gk,
+                    initial_state,
+                    cu_seqlens,
+                    chunk_indices,
+                    chunk_offsets,
+                )
+            )
+        ):
+            raise ValueError("Invalid or overlapping chunk-state output buffer")
+        h = h_out
     final_state = (
         k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
     )

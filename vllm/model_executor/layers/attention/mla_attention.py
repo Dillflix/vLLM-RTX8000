@@ -1000,18 +1000,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if attn_metadata is None:
-            # During the profile run try to simulate to worse case output size
-            # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
-            # since this can be large
-            _ = torch.empty(
-                (
-                    self.chunked_prefill_workspace_size,
-                    self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                ),
-                device=k_c_normed.device,
-                dtype=k_c_normed.dtype,
-            )
+            # Only dense-MHA prefill expands cached latent KV through
+            # kv_b_proj. Sparse-only implementations must profile their actual
+            # transient buffers in reserve_workspace(), not this dense tensor.
+            if not self.impl.profiles_prefill_workspace:
+                _ = torch.empty(
+                    (
+                        self.chunked_prefill_workspace_size,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
             self.impl.reserve_workspace()
 
             # The zero fill is required when used with DP + EP

@@ -14,12 +14,47 @@ from __future__ import annotations
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.v1.attention.ops.common import pack_ue8m0_x4
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
+
+
+def _fp8_store_view(tensor: torch.Tensor) -> torch.Tensor:
+    # Triton rejects E4M3FN pointer types before SM89, even for storage only.
+    capability = current_platform.get_device_capability()
+    if capability is not None and capability.to_int() < 89:
+        return tensor.view(torch.uint8)
+    return tensor.view(torch.float8_e4m3fn)
+
+
+@triton.jit
+def _e4m3fn_encode_finite(x):
+    """Encode finite, saturated FP32 values as E4M3FN bytes with RTNE."""
+    bits = x.to(tl.float32).to(tl.uint32, bitcast=True)
+    sign = (bits >> 24) & 0x80
+    magnitude = bits & 0x7FFFFFFF
+    # Normal E4M3 values retain three fraction bits from the FP32 mantissa.
+    rounded = magnitude + 0x7FFFF + ((magnitude >> 20) & 1)
+    normal = (rounded >> 20) - (120 << 3)
+    # E4M3 subnormals have a constant 2**-9 step, including signed zero.
+    scaled = tl.abs(x) * 512.0
+    integral = tl.floor(scaled)
+    remainder = scaled - integral
+    subnormal = integral.to(tl.uint32)
+    subnormal += (remainder > 0.5) | ((remainder == 0.5) & ((subnormal & 1) != 0))
+    encoded = tl.where(magnitude < 0x3C800000, subnormal, normal)
+    return (sign | encoded).to(tl.uint8)
+
+
+@triton.jit
+def _store_e4m3fn(ptr, value, mask):
+    if ptr.dtype.element_ty == tl.uint8:
+        value = _e4m3fn_encode_finite(value)
+    tl.store(ptr, value, mask=mask)
 
 
 # Hadamard-128 rotation
@@ -67,11 +102,12 @@ def _fwht_quant_kernel(
     sout_ptr,
     n_rows,
     BLOCK_R: tl.constexpr,
+    QUANTIZE: tl.constexpr = True,
 ):
     """Fused Hadamard-128 rotation + per-row absmax FP8 (ue8m0) quant.
 
-    Each row uses fp32 butterflies and scaling, rounds to bf16, then applies
-    absmax quantization with a power-of-two scale.
+    Each row uses fp32 butterflies and scaling, rounds to the input dtype,
+    then applies absmax quantization with a power-of-two scale.
     """
     pid = tl.program_id(0)
     rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -95,16 +131,32 @@ def _fwht_quant_kernel(
     x = _fwht_stage(x, N, BLOCK_R, 64)
     x = x * 0.08838834764831845  # 1/sqrt(128), exact in fp32
 
-    # Match the unfused path's bf16 materialization before quantizing.
-    x = x.to(tl.bfloat16).to(tl.float32)
+    # Match the unfused path's model-dtype materialization before quantizing.
+    x = x.to(q_ptr.dtype.element_ty).to(tl.float32)
     x = tl.reshape(x, (BLOCK_R, 128))
 
-    absmax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
-    scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
-    y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
+    out_ptr = qout_ptr + rows[:, None] * 128 + offs[None, :]
+    if QUANTIZE:
+        absmax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
+        scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
+        y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
+        _store_e4m3fn(out_ptr, y, rmask[:, None])
+        tl.store(sout_ptr + rows, scale, mask=rmask)
+    else:
+        tl.store(out_ptr, x, mask=rmask[:, None])
 
-    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y, mask=rmask[:, None])
-    tl.store(sout_ptr + rows, scale, mask=rmask)
+
+def fwht128_fp16(q: torch.Tensor) -> torch.Tensor:
+    """Rotate FP16 query rows without introducing an FP8 quantization step."""
+    assert q.ndim == 2 and q.shape[1] == 128, q.shape
+    assert q.dtype == torch.float16 and q.is_contiguous()
+    out = torch.empty_like(q)
+    n_rows = q.shape[0]
+    if n_rows:
+        _fwht_quant_kernel[(triton.cdiv(n_rows, 32),)](
+            q, out, None, n_rows, BLOCK_R=32, QUANTIZE=False, num_warps=2
+        )
+    return out
 
 
 def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -114,14 +166,14 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     fp32 `1 / sqrt(128)` scale before block-128 ue8m0 quantization.
 
     Args:
-        q: `[rows, 128]` bf16 — one head vector per row.
+        q: `[rows, 128]` fp16 or bf16 — one head vector per row.
 
     Returns:
         (q_fp8 `[rows, 128]` float8_e4m3fn, scale `[rows, 1]` float32).
 
     """
     assert q.ndim == 2 and q.shape[1] == 128, q.shape
-    assert q.dtype == torch.bfloat16
+    assert q.dtype in (torch.float16, torch.bfloat16)
     assert q.is_contiguous()
     n_rows = q.shape[0]
     q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
@@ -130,7 +182,9 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return q_fp8, q_scale
     BLOCK_R = 32
     grid = (triton.cdiv(n_rows, BLOCK_R),)
-    _fwht_quant_kernel[grid](q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    _fwht_quant_kernel[grid](
+        q, _fp8_store_view(q_fp8), q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2
+    )
     return q_fp8, q_scale
 
 
@@ -216,10 +270,10 @@ def _kpool_softmax_rotate_write_cache_kernel(
         acc += k * prob
 
     x = acc / denom
-    x = tl.where(do_write, x, 0.0).to(tl.bfloat16).to(tl.float32)
+    x = tl.where(do_write, x, 0.0).to(slot_k_ptr.dtype.element_ty).to(tl.float32)
 
-    # Match the unfused pooled-K path's bf16 precision before quantization.
-    x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
+    # Match the unfused pooled-K path's model dtype before quantization.
+    x = _hadamard128(x).to(slot_k_ptr.dtype.element_ty).to(tl.float32)
 
     # --- per-vector absmax fp8 quant ---
     fp8_max = 448.0
@@ -247,7 +301,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
             + S_OFFSET_NBYTES_IN_PAGE // 4
             + loc_token_offset_in_page
         )
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+        _store_e4m3fn(buf_fp8_ptr + out_k_offsets, quantized, mask)
         if MX_SCALE:
             tl.store(
                 buf_fp32_ptr.to(tl.pointer_type(tl.int32)) + out_s_offset,
@@ -258,10 +312,10 @@ def _kpool_softmax_rotate_write_cache_kernel(
             tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
 
     if RETURN_COMPRESSED:
-        tl.store(
+        _store_e4m3fn(
             compressed_k_ptr + row * HEAD_DIM + offs,
             quantized,
-            mask=offs < HEAD_DIM,
+            offs < HEAD_DIM,
         )
         tl.store(compressed_scale_ptr + row, scale)
 
@@ -283,7 +337,7 @@ def kpool_compress_and_write_cache(
 
     Args:
         kv_cache: indexer K cache `[num_blocks, block_size, head_dim+4]` uint8.
-        slot_k: `[n_pools, pool_size, head_dim]` bf16 — raw per-token K.
+        slot_k: `[n_pools, pool_size, head_dim]` fp16 or bf16 — raw per-token K.
         slot_score: `[n_pools, pool_size, head_dim]` — per-token gate score.
         ape: `[pool_size, head_dim]` fp32 — per-slot position bias.
         loc: `[n_pools]` int64 — flat physical slot per pool.
@@ -299,7 +353,8 @@ def kpool_compress_and_write_cache(
     assert slot_score.shape == slot_k.shape
     assert ape.shape == slot_k.shape[1:]
     assert slot_k.shape[2] == head_dim
-    assert slot_k.dtype == torch.bfloat16
+    assert slot_k.dtype in (torch.float16, torch.bfloat16)
+    assert slot_score.dtype == slot_k.dtype
     assert ape.dtype == torch.float32
     assert kv_cache.dtype == torch.uint8
     assert loc.dtype == torch.int64
@@ -332,7 +387,7 @@ def kpool_compress_and_write_cache(
             )
         return None
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_fp8 = _fp8_store_view(buf)
     buf_fp32 = buf.view(torch.float32)
     mx_scale = write_cache and mqa_logits_use_mx_scales()
     # bytes per page (last dim of kv_cache) viewed as uint8
@@ -360,7 +415,7 @@ def kpool_compress_and_write_cache(
         ape,
         loc,
         write_mask,
-        compressed_k,
+        _fp8_store_view(compressed_k),
         compressed_scale,
         slot_k.stride(0),
         slot_k.stride(1),
@@ -441,10 +496,10 @@ def kpool_seed_tail_cache(
     head_dim: int = INDEX_HEAD_DIM,
 ) -> None:
     """Seed the paged tail cache from a prefill batch (see the kernel)."""
-    assert tail_kv_cache.dtype == torch.bfloat16
+    assert tail_kv_cache.dtype in (torch.float16, torch.bfloat16)
     assert tail_kv_cache.ndim == 4 and tail_kv_cache.shape[1] == 2
     assert tail_kv_cache.stride(3) == 1 and tail_kv_cache.stride(2) == head_dim
-    assert key.dtype == torch.bfloat16
+    assert key.dtype == gate_score.dtype == tail_kv_cache.dtype
     n = tslot.shape[0]
     if n == 0:
         return
@@ -472,10 +527,10 @@ def _kpool_decode_update_batched_kernel(
     buf_fp32_ptr,
     tail_kv_ptr,
     tail_slot_mapping_ptr,  # [B, NEXT_N] int32
-    key_ptr,  # [B, NEXT_N, HEAD_DIM] bf16
+    key_ptr,  # [B, NEXT_N, HEAD_DIM] model dtype
     key_stride_b,
     key_stride_t,
-    slot_score_ptr,  # [B, NEXT_N, HEAD_DIM] bf16
+    slot_score_ptr,  # [B, NEXT_N, HEAD_DIM] model dtype
     ss_stride_b,
     ss_stride_t,
     ape_ptr,
@@ -592,8 +647,8 @@ def _kpool_decode_update_batched_kernel(
                 k = tl.where(is_current, key, k_buf)
                 acc += k * prob
 
-            x = (acc / denom).to(tl.bfloat16).to(tl.float32)
-            x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
+            x = (acc / denom).to(key_ptr.dtype.element_ty).to(tl.float32)
+            x = _hadamard128(x).to(key_ptr.dtype.element_ty).to(tl.float32)
 
             fp8_max = 448.0
             fp8_max_inv = 1.0 / fp8_max
@@ -617,7 +672,7 @@ def _kpool_decode_update_batched_kernel(
                 + S_OFFSET_NBYTES_IN_PAGE // 4
                 + loc_token_offset_in_page
             )
-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            _store_e4m3fn(buf_fp8_ptr + out_k_offsets, quantized, dim_mask)
             if MX_SCALE:
                 tl.store(
                     buf_fp32_ptr.to(tl.pointer_type(tl.int32)) + out_s_offset,
@@ -669,10 +724,10 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     Args:
         kv_cache: indexer K cache `[num_blocks, block_size, head_dim+4]` uint8.
         tail_kv_cache: paged tail cache `[num_blocks, 2, pool_size, head_dim]`
-            bf16 (K at half 0, gate score at half 1).
+            fp16 or bf16 (K at half 0, gate score at half 1).
         tail_slot_mapping: `[num_requests, next_n]` int32.
-        key: `[num_requests, next_n, head_dim]` bf16.
-        slot_score: `[num_requests, next_n, head_dim]` bf16.
+        key: `[num_requests, next_n, head_dim]` in the tail cache dtype.
+        slot_score: `[num_requests, next_n, head_dim]` in the tail cache dtype.
         ape: `[pool_size, head_dim]` fp32.
         slot_mapping: `[num_requests, next_n]` int32.
         positions: `[num_requests, next_n]` int32.
@@ -689,21 +744,20 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     ring = tail_kv_cache.shape[2]
     assert ring >= pool_size and ring % pool_size == 0, (ring, pool_size)
     assert tail_kv_cache.shape[3] == head_dim
-    assert tail_kv_cache.dtype == torch.bfloat16
+    assert tail_kv_cache.dtype in (torch.float16, torch.bfloat16)
     assert key.ndim == 3 and key.shape[2] == head_dim
     assert slot_score.shape == key.shape
     assert ape.shape == (pool_size, head_dim)
     assert tail_slot_mapping.shape == (num_requests, next_n)
     assert slot_mapping.shape == (num_requests, next_n)
     assert positions.shape == (num_requests, next_n)
-    assert key.dtype == torch.bfloat16
-    assert slot_score.dtype == torch.bfloat16
+    assert key.dtype == slot_score.dtype == tail_kv_cache.dtype
     assert ape.dtype == torch.float32
     assert kv_cache.dtype == torch.uint8
 
     page_size = kv_cache.shape[1]
     buf = kv_cache
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_fp8 = _fp8_store_view(buf)
     buf_fp32 = buf.view(torch.float32)
 
     # The kernel indexes the int tensors as ``req * next_n + t`` (row-major),

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
-from typing import ClassVar, Literal
+from collections.abc import Callable, Iterable
+from typing import Any, ClassVar, Literal, cast
 
 import torch
 from torch import nn
@@ -576,7 +576,10 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
 
-            if vllm_config.kernel_config.enable_jit_warmup:
+            if vllm_config.kernel_config.enable_jit_warmup and not (
+                vllm_config.model_config.dtype == torch.float16
+                and current_platform.is_device_capability(75)
+            ):
                 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
                     _HC_PRENORM_GEMM_TILELANG_KERNEL,
                     _MHC_FUSED_TILELANG_KERNEL,
@@ -818,8 +821,24 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
 
+        self.glm_sm75_lossless_embedding = cast(
+            dict[str, Any], vllm_config.additional_config
+        ).get("glm_sm75_lossless_embedding", False)
+        if type(self.glm_sm75_lossless_embedding) is not bool:
+            raise ValueError("glm_sm75_lossless_embedding must be a boolean")
         if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
+            embedding_factory: Callable[..., VocabParallelEmbedding] = (
+                VocabParallelEmbedding
+            )
+            if self.glm_sm75_lossless_embedding:
+                from functools import partial
+
+                from vllm.models.glm5next.nvidia.ops.embedding_lossless_sm75 import (
+                    make_embedding,
+                )
+
+                embedding_factory = partial(make_embedding, vllm_config)
+            self.embed_tokens = embedding_factory(
                 config.vocab_size,
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
@@ -869,6 +888,19 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        shape: tuple[int, ...] = (batch_size, self.config.hidden_size)
+        if self.config.mhc:
+            shape = (batch_size, self.config.hc_mult, self.config.hidden_size)
+        return IntermediateTensors(
+            {"hidden_states": torch.zeros(shape, dtype=dtype, device=device)}
+        )
+
     def _aux_hidden_state(
         self,
         hidden_states: torch.Tensor,
@@ -884,6 +916,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         `hidden_size`. Non-mHC layers already return the summed stream.
         """
         if post is None:
+            if self.config.mhc and hidden_states.ndim == 3:
+                return hc_contract(hidden_states, self.config.hc_mult)
             return hidden_states
         assert residual is not None and comb is not None
         completed = self._aux_post_op(hidden_states, residual, post, comb)
@@ -896,7 +930,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -908,9 +942,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
+            # The sender completes hc_post; enter this stage with the full
+            # residual stream and run standalone hc_pre in its first layer.
+            residual = None
             post = None
             comb = None
 
@@ -932,14 +966,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            if post is not None:
+                assert residual is not None and comb is not None
+                hidden_states = self._aux_post_op(hidden_states, residual, post, comb)
+            # PP receives complete token rows, then shards them locally when
+            # SP is enabled. Keep all hc_mult streams until the final layer.
+            if self.is_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.end_layer in self.aux_hidden_state_layers:
             final_aux = self._aux_hidden_state(hidden_states, residual, post, comb)
@@ -1028,6 +1062,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+            # Skip absent stages before FP8 helpers collect/dequantize their
+            # weights or the MegaMoE loader resolves their submodules.
+            if is_pp_missing_parameter(name, self):
+                continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
@@ -1169,6 +1207,46 @@ class Glm5NextForCausalLM(
         self.model_config = vllm_config.model_config
         self.vllm_config = vllm_config
         self.config = self.model_config.hf_text_config
+        self.glm_native_dense = cast(dict[str, Any], vllm_config.additional_config).get(
+            "glm_native_dense", False
+        )
+        if type(self.glm_native_dense) is not bool:
+            raise ValueError("glm_native_dense must be a boolean")
+        self.glm_native_dense_mtp = False
+        if "glm_native_dense_mtp" in cast(
+            dict[str, Any], vllm_config.additional_config
+        ):
+            from vllm.models.glm5next.nvidia.ops.dense_sm75 import (
+                validate_mtp_configuration,
+            )
+
+            self.glm_native_dense_mtp = validate_mtp_configuration(vllm_config)
+        self.glm_native_dense_installed: list[dict] = []
+        self.glm_sm75_lossless_head = False
+        if "glm_sm75_lossless_head" in cast(
+            dict[str, Any], vllm_config.additional_config
+        ):
+            from vllm.models.glm5next.nvidia.ops.head_lossless_sm75 import (
+                validate_configuration as validate_lossless_head,
+            )
+
+            self.glm_sm75_lossless_head = validate_lossless_head(vllm_config)
+        self.glm_lossless_head_installed: list[dict] = []
+        if self.glm_native_dense:
+            from vllm.models.glm5next.nvidia.ops.dense_sm75 import (
+                validate_configuration,
+            )
+
+            validate_configuration(
+                dtype=self.model_config.dtype,
+                capability=current_platform.get_device_capability(),
+                tensor_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
+                pipeline_parallel_size=vllm_config.parallel_config.pipeline_parallel_size,
+                model_type=self.config.model_type,
+                compilation_mode=vllm_config.compilation_config.mode,
+                linear_backend=vllm_config.kernel_config.linear_backend,
+                has_lora=vllm_config.lora_config is not None,
+            )
         quant_config = vllm_config.quant_config
         self.quant_config = quant_config
         self.model = Glm5NextModel(
@@ -1185,6 +1263,9 @@ class Glm5NextForCausalLM(
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=_LOGIT_SCALE
+        )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1257,6 +1338,24 @@ class Glm5NextForCausalLM(
         for module in self.modules():
             if isinstance(module, Glm5NextMoE):
                 module.finalize_mega_moe_weights()
+        if self.glm_native_dense:
+            from vllm.models.glm5next.nvidia.ops.dense_sm75 import install
+
+            installed = install(self, mtp=self.glm_native_dense_mtp)
+            if installed:
+                self.glm_native_dense_installed = installed
+        if self.model.glm_sm75_lossless_embedding:
+            from vllm.models.glm5next.nvidia.ops.embedding_lossless_sm75 import (
+                install as install_lossless_embedding,
+            )
+
+            self.glm_lossless_embedding_installed = install_lossless_embedding(self)
+        if self.glm_sm75_lossless_head:
+            from vllm.models.glm5next.nvidia.ops.head_lossless_sm75 import (
+                install as install_lossless_head,
+            )
+
+            self.glm_lossless_head_installed = install_lossless_head(self)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1327,6 +1426,15 @@ class Glm5NextForConditionalGeneration(
         self.is_multimodal_pruning_enabled = (
             multimodal_config.is_multimodal_pruning_enabled()
         )
+        from vllm.models.glm5next.nvidia.ops.vision_stream_sm75 import (
+            validate_vision_stream,
+        )
+
+        self.glm_sm75_stream_vision = validate_vision_stream(vllm_config)
+        self.glm_sm75_shard_encoder_cache = cast(
+            dict[str, Any], vllm_config.additional_config
+        ).get("glm_sm75_shard_encoder_cache", False)
+        self._glm_vision_stream_config = vllm_config
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.visual = Glm5NextVisionTransformer(
@@ -1354,9 +1462,49 @@ class Glm5NextForConditionalGeneration(
 
         self.set_moe_parameters()
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def _process_image_input(self, image_input):
+        if not self.glm_sm75_stream_vision:
+            return super()._process_image_input(image_input)
+        if image_input["type"] == "image_embeds":
+            embeds = image_input["image_embeds"].to(
+                device=self.visual.device, dtype=self.visual.dtype
+            )
+            sizes = (image_input["image_grid_thw"].prod(-1) // 4).tolist()
+            return embeds.split(sizes)
+        from vllm.models.glm5next.nvidia.ops.vision_stream_sm75 import (
+            stream_vision_features,
+        )
+
+        return stream_vision_features(
+            self.visual,
+            image_input["pixel_values"],
+            image_input["image_grid_thw"],
+            self._glm_vision_stream_config,
+        )
+
+    def _process_video_input(self, video_input):
+        if not self.glm_sm75_stream_vision:
+            return super()._process_video_input(video_input)
+        if video_input["type"] == "video_embeds":
+            embeds = video_input["video_embeds"].to(
+                device=self.visual.device, dtype=self.visual.dtype
+            )
+            sizes = (video_input["video_grid_thw"].prod(-1) // 4).tolist()
+            return embeds.split(sizes)
+        from vllm.models.glm5next.nvidia.ops.vision_stream_sm75 import (
+            stream_vision_features,
+        )
+
+        return stream_vision_features(
+            self.visual,
+            video_input["pixel_values_videos"],
+            video_input["video_grid_thw"],
+            self._glm_vision_stream_config,
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [

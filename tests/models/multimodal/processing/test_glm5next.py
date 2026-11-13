@@ -456,3 +456,16 @@ def test_image_encoder_cache_follows_max_pixels_override():
         info.get_num_image_tokens(image_width=size.width, image_height=size.height)
         == 100
     )
+
+
+@pytest.mark.parametrize("budget", [256, 32768])
+def test_sm75_image_chunks_preserve_every_complete_native_image(budget):
+    """A small transfer budget must never split or trim spatial attention."""
+    from vllm.models.glm5next.nvidia.ops.vision_stream_sm75 import frame_chunk_plan
+
+    total, features = frame_chunk_plan([[1, 160, 200]] * 4, max_patches=budget)
+    assert total == 128000
+    assert features == [
+        (8000, [(index * 32000, (index + 1) * 32000, [1, 160, 200])])
+        for index in range(4)
+    ]

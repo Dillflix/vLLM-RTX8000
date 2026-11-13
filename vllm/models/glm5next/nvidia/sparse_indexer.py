@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+from typing import Any, cast
+
 import torch
 
 import vllm.envs as envs
@@ -34,6 +36,11 @@ from vllm.models.glm5next.common.sparse_indexer import (
     kv_cache_as_quant_view,
 )
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
+from vllm.models.glm5next.nvidia.ops import native_topk_sm75
+from vllm.models.glm5next.nvidia.ops.mqa_logits_sm75 import (
+    fp8_mqa_logits_sm75,
+    fp8_paged_mqa_logits_sm75,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -51,6 +58,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
     dense_logits_rows,
+    sm75_glm_request_gather_rows,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -59,6 +67,16 @@ if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
 
 logger = init_logger(__name__)
+
+_SM75_FP16_KEYS_MIN_ROWS = 480
+
+
+def _sm75_logits_scratch_elements(max_rows: int, max_pool_len: int) -> int:
+    # Every window fits the logits budget, except that even an over-budget
+    # single row is allowed by dense_logits_rows. Do not round using max width:
+    # smaller widths can use more rows and approach the budget more closely.
+    budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
+    return max(max_pool_len, min(max_rows * max_pool_len, budget))
 
 
 # kpool write helper: form pools from the current token batch and compress them
@@ -146,13 +164,34 @@ def sparse_attn_indexer_kpool(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     logits_dtype: torch.dtype = torch.float32,
+    sm75_prefill_fp16_keys: bool = False,
+    sm75_dynamic_mqa: bool = False,
+    sm75_mqa_scratch: bool = False,
+    sm75_bound_gather: bool = False,
+    sm75_native_topk: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
+    use_sm75_mqa = current_platform.is_device_capability(75)
+    logits_scratch_elements = 0
+    if sm75_mqa_scratch:
+        profiled_rows = current_workspace_manager().get_persistent_resource(
+            ("glm_sm75_mqa_scratch_rows", max_pool_len), lambda: [0]
+        )
+        if not isinstance(attn_metadata, dict):
+            profiled_rows[0] = max(profiled_rows[0], q_quant.shape[0])
+        elif q_quant.shape[0] > profiled_rows[0]:
+            raise RuntimeError("SM75 MQA query batch exceeds profiled scratch rows")
+        max_rows = profiled_rows[0]
+        logits_scratch_elements = (
+            native_topk_sm75.scratch_elements(max_rows, max_pool_len)
+            if sm75_native_topk
+            else _sm75_logits_scratch_elements(max_rows, max_pool_len)
+        )
 
-    fused_mqa_topk = use_fused_mqa_topk(
+    fused_mqa_topk = not use_sm75_mqa and use_fused_mqa_topk(
         query_shape=q_quant.shape[1:],
         topk=topk_tokens // max(index_kpool, 1),
         fp4_cache=use_fp4_cache,
@@ -165,10 +204,18 @@ def sparse_attn_indexer_kpool(
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
+        scratch_specs: list[tuple[tuple[int, ...], torch.dtype]] = (
+            [((total_seq_lens, head_dim), torch.float16)]
+            if sm75_prefill_fp16_keys
+            else []
+        )
+        if sm75_mqa_scratch:
+            scratch_specs.append(((logits_scratch_elements,), torch.float32))
         current_workspace_manager().get_simultaneous(
             values_spec,
             scales_spec,
             ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            *scratch_specs,
         )
         # Allocate the largest fused_mqa_topk workspaces so they are accounted
         # for (freed again, they overlap the dense logits below).
@@ -204,7 +251,13 @@ def sparse_attn_indexer_kpool(
             // torch.float32.itemsize
             * bytes_per_elem
         )
-        max_logits_elems = max(decode_logits_elems, prefill_cap_elems)
+        # Opt-in prefill logits are already reserved in the simultaneous
+        # workspace above. Decode retains its separate output allocation.
+        max_logits_elems = (
+            decode_logits_elems
+            if sm75_mqa_scratch
+            else max(decode_logits_elems, prefill_cap_elems)
+        )
         _ = torch.empty(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
         )
@@ -339,16 +392,34 @@ def sparse_attn_indexer_kpool(
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
-        k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
-            values_spec,
-            scales_spec,
+        scratch_specs = (
+            [((total_seq_lens, head_dim), torch.float16)]
+            if sm75_prefill_fp16_keys
+            else []
         )
+        if sm75_mqa_scratch:
+            scratch_specs.append(((logits_scratch_elements,), torch.float32))
+        k_quant_full, k_scale_full, *scratch = workspace_manager.get_simultaneous(
+            values_spec, scales_spec, *scratch_specs
+        )
+        fp16_scratch = scratch[:1] if sm75_prefill_fp16_keys else []
+        logits_scratch = scratch[-1] if sm75_mqa_scratch else None
+        fp16_keys_ready = False
         for chunk in prefill_metadata.chunks if not short_prefill else ():
             # Under DCP this rank only gathers the pools it owns.
             assert chunk.local_cu_seq_lens is not None
+            if sm75_bound_gather and not (
+                0
+                <= chunk.local_total_seq_lens
+                <= chunk.max_local_total_seq_lens
+                <= total_seq_lens
+            ):
+                raise RuntimeError("GLM indexer gather exceeds its profiled workspace")
             k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
 
+            if not chunk.skip_kv_gather:
+                fp16_keys_ready = False
             if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
@@ -381,6 +452,23 @@ def sparse_attn_indexer_kpool(
                 ).squeeze(-1)
 
             num_rows = q_slice.shape[0]
+            if (
+                sm75_prefill_fp16_keys
+                and (
+                    chunk.sm75_legacy_chunk_rows
+                    if chunk.sm75_legacy_chunk_rows is not None
+                    else num_rows
+                )
+                >= _SM75_FP16_KEYS_MIN_ROWS
+                and chunk.local_total_seq_lens > 0
+            ):
+                fp16_keys = fp16_scratch[0][: chunk.max_local_total_seq_lens]
+                if not fp16_keys_ready:
+                    # Format conversion only: the unchanged FP32 key scales
+                    # still apply exactly once in MQA.
+                    fp16_keys.copy_(k_quant)
+                    fp16_keys_ready = True
+                k_quant_cast = fp16_keys
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
             # so topk selects pools. We pick topk_tokens // kpool pools then
             # expand each pool back to its kpool constituent tokens.
@@ -395,6 +483,18 @@ def sparse_attn_indexer_kpool(
 
             # Rows per dense logits call under the logits budget.
             dense_rows = dense_logits_rows(chunk.max_seqlen_k)
+            if sm75_native_topk:
+                assert logits_scratch is not None
+            if sm75_native_topk and (
+                not native_topk_sm75.use_native(
+                    min(num_rows, dense_rows), chunk.max_seqlen_k
+                )
+            ):
+                assert logits_scratch is not None
+                dense_rows = min(
+                    dense_rows,
+                    max(1, logits_scratch.numel() // max(1, chunk.max_seqlen_k)),
+                )
             if chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((num_rows, 0), dtype=torch.float32)
                 topk_dst.fill_(-1)
@@ -427,18 +527,74 @@ def sparse_attn_indexer_kpool(
                     )
                     # Compressed: row i starts at K position cu_seqlen_ks[i].
                     row_ends = cu_seqlen_ke[rows] - cu_seqlen_ks[rows]
-                    logits = as_fp32_logits(
-                        fp8_fp4_mqa_logits(
-                            (q_slice_cast[rows], q_scale_rows),
+                    if sm75_native_topk and native_topk_sm75.use_native(
+                        rows.stop - rows.start, chunk.max_seqlen_k
+                    ):
+                        # Exact local top-512 plus hierarchical merge. Reuse the
+                        # existing arena; never materialize the full score matrix.
+                        if select_k != 512 or dcp_world_size != 1:
+                            raise RuntimeError("Unsupported native GLM top-k layout")
+                        fp8_arithmetic = k_quant_cast.dtype != torch.float16
+                        native_keys = k_quant_cast
+                        if fp8_arithmetic:
+                            native_keys = fp16_scratch[0][
+                                : chunk.max_local_total_seq_lens
+                            ]
+                            if not fp16_keys_ready:
+                                native_keys.copy_(k_quant)
+                                fp16_keys_ready = True
+                        native_topk_sm75.select(
+                            q_slice_cast[rows],
+                            native_keys,
+                            k_scale_cast,
+                            chunk_weights,
+                            cu_seqlen_ks[rows],
+                            cu_seqlen_ke[rows],
+                            chunk.max_seqlen_k,
+                            logits_scratch,
+                            topk_dst[rows],
+                            fp8_arithmetic=fp8_arithmetic,
+                        )
+                        # DCP=1 merge is a no-op; keep its argument defined.
+                        logits = None
+                        continue
+                    if use_sm75_mqa:
+                        logits_out = None
+                        if logits_scratch is not None:
+                            window_rows = rows.stop - rows.start
+                            required = window_rows * chunk.max_seqlen_k
+                            if required > logits_scratch.numel():
+                                raise RuntimeError(
+                                    "SM75 MQA logits exceed profiled scratch"
+                                )
+                            # Use a contiguous view: the unchanged kernel indexes
+                            # rows by the current WIDTH, not the maximum width.
+                            logits_out = logits_scratch[:required].view(
+                                window_rows, chunk.max_seqlen_k
+                            )
+                        logits = fp8_mqa_logits_sm75(
+                            q_slice_cast[rows],
                             (k_quant_cast, k_scale_cast),
                             chunk_weights,
                             cu_seqlen_ks[rows],
                             cu_seqlen_ke[rows],
                             chunk.max_seqlen_k,
-                            logits_dtype=logits_dtype,
-                        ),
-                        row_ends,
-                    )
+                            dynamic_lengths=sm75_dynamic_mqa,
+                            out=logits_out,
+                        )
+                    else:
+                        logits = as_fp32_logits(
+                            fp8_fp4_mqa_logits(
+                                (q_slice_cast[rows], q_scale_rows),
+                                (k_quant_cast, k_scale_cast),
+                                chunk_weights,
+                                cu_seqlen_ks[rows],
+                                cu_seqlen_ke[rows],
+                                chunk.max_seqlen_k,
+                                logits_dtype=logits_dtype,
+                            ),
+                            row_ends,
+                        )
                     if logits.shape[1] == 0:
                         topk_dst[rows].fill_(-1)
                     else:
@@ -665,20 +821,30 @@ def sparse_attn_indexer_kpool(
             logits_dtype,
         )
         # SM100 decode is varlen: one row and context length per token.
-        logits = as_fp32_logits(
-            fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
+        if use_sm75_mqa:
+            logits = fp8_paged_mqa_logits_sm75(
+                padded_q_quant_cast,
                 kv_cache,
                 decode_weights,
                 seq_lens,
                 decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
                 max_model_len=max_pool_len,
-                logits_dtype=logits_dtype,
-                indices=decode_metadata.indices,
-            ),
-            seq_lens.view(-1),
-        )
+            )
+        else:
+            logits = as_fp32_logits(
+                fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_pool_len,
+                    logits_dtype=logits_dtype,
+                    indices=decode_metadata.indices,
+                ),
+                seq_lens.view(-1),
+            )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
@@ -787,11 +953,158 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        use_sm75_mqa = (
+            current_platform.is_cuda() and current_platform.is_device_capability(75)
+        )
+        if use_sm75_mqa and use_fp4_cache:
+            raise ValueError("SM75 GLM indexer supports FP8 cache, not FP4 cache")
+        if current_platform.is_cuda() and not use_sm75_mqa and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
         _cfg = get_current_vllm_config_or_none()
+        self.sm75_prefill_fp16_keys = (
+            cast(dict[str, Any], _cfg.additional_config).get(
+                "glm_sm75_prefill_fp16_keys", False
+            )
+            if _cfg is not None
+            else False
+        )
+        if not isinstance(self.sm75_prefill_fp16_keys, bool):
+            raise ValueError("glm_sm75_prefill_fp16_keys must be a boolean")
+        if self.sm75_prefill_fp16_keys and (
+            _cfg is None
+            or not use_sm75_mqa
+            or use_fp4_cache
+            or _cfg.parallel_config.decode_context_parallel_size != 1
+            or _cfg.parallel_config.prefill_context_parallel_size != 1
+            or (
+                _cfg.model_config is not None
+                and _cfg.model_config.dtype != torch.float16
+            )
+        ):
+            raise ValueError(
+                "glm_sm75_prefill_fp16_keys requires SM75 FP16 GLM with PCP=DCP=1"
+            )
+        self.sm75_dynamic_mqa = (
+            cast(dict[str, Any], _cfg.additional_config).get(
+                "glm_sm75_dynamic_mqa", False
+            )
+            if _cfg is not None
+            else False
+        )
+        if not isinstance(self.sm75_dynamic_mqa, bool):
+            raise ValueError("glm_sm75_dynamic_mqa must be a boolean")
+        if self.sm75_dynamic_mqa and (
+            _cfg is None
+            or not use_sm75_mqa
+            or use_fp4_cache
+            or _cfg.parallel_config.decode_context_parallel_size != 1
+            or _cfg.parallel_config.prefill_context_parallel_size != 1
+            or (
+                _cfg.model_config is not None
+                and _cfg.model_config.dtype != torch.float16
+            )
+        ):
+            raise ValueError(
+                "glm_sm75_dynamic_mqa requires SM75 FP16 GLM with PCP=DCP=1"
+            )
+        self.sm75_mqa_scratch = (
+            cast(dict[str, Any], _cfg.additional_config).get(
+                "glm_sm75_mqa_scratch", False
+            )
+            if _cfg is not None
+            else False
+        )
+        if not isinstance(self.sm75_mqa_scratch, bool):
+            raise TypeError("glm_sm75_mqa_scratch must be a boolean")
+        if self.sm75_mqa_scratch and (
+            _cfg is None
+            or not use_sm75_mqa
+            or use_fp4_cache
+            or _cfg.parallel_config.decode_context_parallel_size != 1
+            or _cfg.parallel_config.prefill_context_parallel_size != 1
+            or (
+                _cfg.model_config is not None
+                and _cfg.model_config.dtype != torch.float16
+            )
+        ):
+            raise ValueError(
+                "glm_sm75_mqa_scratch requires SM75 FP16 GLM with PCP=DCP=1"
+            )
+        self.sm75_native_topk = (
+            cast(dict[str, Any], _cfg.additional_config).get(
+                "glm_sm75_native_topk", False
+            )
+            if _cfg is not None
+            else False
+        )
+        if not isinstance(self.sm75_native_topk, bool):
+            raise TypeError("glm_sm75_native_topk must be a boolean")
+        if self.sm75_native_topk and (
+            _cfg is None
+            or not self.sm75_prefill_fp16_keys
+            or not self.sm75_dynamic_mqa
+            or not self.sm75_mqa_scratch
+            or head_dim != 128
+            or topk_tokens != 2048
+            or use_fp4_cache
+        ):
+            raise ValueError(
+                "Native top-k requires the qualified SM75 GLM FP8 H32/D128 profile"
+            )
+        self.sm75_bound_gather = (
+            cast(dict[str, Any], _cfg.additional_config).get(
+                "glm_sm75_bound_gather", False
+            )
+            if _cfg is not None
+            else False
+        )
+        if not isinstance(self.sm75_bound_gather, bool):
+            raise TypeError("glm_sm75_bound_gather must be a boolean")
+        if self.sm75_bound_gather:
+            assert _cfg is not None
+            if (
+                not use_sm75_mqa
+                or use_fp4_cache
+                or _cfg.model_config is None
+                or _cfg.model_config.dtype != torch.float16
+                or _cfg.parallel_config.decode_context_parallel_size != 1
+                or _cfg.parallel_config.prefill_context_parallel_size != 1
+            ):
+                raise ValueError(
+                    "glm_sm75_bound_gather requires SM75 FP16 GLM with PCP=DCP=1"
+                )
+            compression = self.k_cache.get_kv_cache_spec(_cfg).tokens_per_state
+            if not isinstance(compression, int) or compression < 2:
+                raise ValueError("SM75 bounded gather requires a compressed GLM cache")
+            max_length = _cfg.model_config.max_model_len
+            max_requests = _cfg.scheduler_config.max_num_seqs
+            # PCP=DCP=1 metadata sums compressed lengths once per request.
+            # Padded requests have zero length; query subchunks reuse the gather.
+            request_bound = max_requests * (
+                (max_length + compression - 1) // compression
+            )
+            self.max_total_seq_len = min(self.max_total_seq_len, request_bound)
+        self.sm75_request_gather_rows = None
+        if (
+            _cfg is not None
+            and cast(dict[str, Any], _cfg.additional_config).get(
+                "glm_sm75_request_gather_bound", False
+            )
+            is not False
+        ):
+            compression = self.k_cache.get_kv_cache_spec(_cfg).tokens_per_state
+            self.sm75_request_gather_rows = sm75_glm_request_gather_rows(
+                _cfg, compression
+            )
+        if self.sm75_request_gather_rows is not None:
+            self.max_total_seq_len = min(
+                self.max_total_seq_len, self.sm75_request_gather_rows
+            )
+            # Keep the existing per-chunk overflow check even if only this flag
+            # is enabled. Metadata packs requests within the same logical bound.
+            self.sm75_bound_gather = True
         self.topk_backend = (
             _cfg.kernel_config.sparse_indexer_topk_backend
             if _cfg is not None
@@ -804,6 +1117,8 @@ class SparseAttnIndexerKpool(CustomOp):
             if _cfg is not None
             else torch.float32
         )
+        if use_sm75_mqa and self.logits_dtype != torch.float32:
+            raise ValueError("SM75 GLM indexer requires float32 logits")
         _parallel = _cfg.parallel_config if _cfg is not None else None
         self._parallel_config = _parallel
         self.dcp_world_size = 1
@@ -900,4 +1215,9 @@ class SparseAttnIndexerKpool(CustomOp):
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
             self.logits_dtype,
+            self.sm75_prefill_fp16_keys,
+            self.sm75_dynamic_mqa,
+            self.sm75_mqa_scratch,
+            self.sm75_bound_gather,
+            self.sm75_native_topk,
         )

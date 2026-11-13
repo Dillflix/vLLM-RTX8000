@@ -154,8 +154,13 @@ class EncoderRunner:
         # batches as possible. The returned outputs are restored to input order.
         order = sorted(range(len(mm_kwargs)), key=lambda i: mm_kwargs[i][0])
         encoder_outputs: list[torch.Tensor] = []
+        input_device = (
+            torch.device("cpu")
+            if getattr(self.model, "glm_sm75_stream_vision", False)
+            else self.device
+        )
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            [mm_kwargs[i] for i in order], device=self.device, pin_memory=PIN_MEMORY
+            [mm_kwargs[i] for i in order], device=input_device, pin_memory=PIN_MEMORY
         ):
             cg_manager = self.cudagraph_manager
             cudagraph_output = (
@@ -238,6 +243,17 @@ class EncoderRunner:
         query_end = (num_computed_tokens + num_scheduled_tokens).tolist()
 
         mm_embeds: list[torch.Tensor] = []
+        sharded_encoder_cache = getattr(
+            self.model, "glm_sm75_shard_encoder_cache", False
+        )
+        # Invocation-local only: repeated prefix references can reconstruct the
+        # same window once, without retaining GPU slices across scheduler steps.
+        reconstructed: dict[tuple[int, int, int], torch.Tensor] = {}
+        if sharded_encoder_cache:
+            from vllm.models.glm5next.nvidia.ops.encoder_cache_tp import (
+                read_encoder_cache_slice,
+            )
+
         for i, req_id in enumerate(req_ids):
             if exclude_embeddings is not None and exclude_embeddings[i]:
                 continue
@@ -278,9 +294,15 @@ class EncoderRunner:
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
-                    mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
+                    slice_start, slice_end = curr_embeds_start, curr_embeds_end
                 else:
-                    mm_embeds_item = encoder_output[start_idx:end_idx]
+                    slice_start, slice_end = start_idx, end_idx
+                if sharded_encoder_cache:
+                    mm_embeds_item = read_encoder_cache_slice(
+                        encoder_output, slice_start, slice_end, reconstructed
+                    )
+                else:
+                    mm_embeds_item = encoder_output[slice_start:slice_end]
 
                 # Attach modality for Omni interleaved merge (collected on demand).
                 set_mm_embedding_modality(mm_embeds_item, mm_feature.modality)

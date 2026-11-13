@@ -241,7 +241,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
-        # KDA projections remain BF16 because fp8 checkpoints omit their scales.
+        # KDA projections use the model dtype: fp8 checkpoints omit their scales.
         saved_quant_config = vllm_config.quant_config
         try:
             vllm_config.quant_config = None
@@ -359,6 +359,34 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
         )
+        # The global current-vLLM-config exists during initialization, not
+        # normal MRV2 forwards. Bind this model's policy once and pass it through
+        # the chunk call; target and draft modules retain their own config.
+        self.use_sm75_chunk_state_workspace = (
+            additional_config.get("glm_sm75_kda_scratch", False)
+            if isinstance(additional_config, dict)
+            else False
+        )
+        if type(self.use_sm75_chunk_state_workspace) is not bool:
+            raise ValueError("glm_sm75_kda_scratch must be a boolean")
+        parallel = vllm_config.parallel_config
+        if self.use_sm75_chunk_state_workspace and (
+            not current_platform.is_device_capability(75)
+            or vllm_config.model_config.dtype != torch.float16
+            or vllm_config.model_config.hf_text_config.model_type != "glm5_next_text"
+            or parallel.tensor_parallel_size != 2
+            or parallel.pipeline_parallel_size != 2
+            or parallel.data_parallel_size != 1
+            or parallel.enable_dbo
+            or vllm_config.compilation_config.mode != 0
+            or self.local_num_heads != 32
+            or self.head_dim != 128
+            or self.kda_prefill_backend != "triton"
+        ):
+            raise ValueError(
+                "KDA scratch requires GLM FP16 SM75 TP2/PP2, H32/D128, "
+                "Triton prefill, mode0 and no DBO"
+            )
         if self.kda_prefill_backend == "triton":
             l2norm_fwd_block.register_warmup(
                 dtype=vllm_config.model_config.dtype,
@@ -484,7 +512,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             dim=-1,
         )
 
-        # Beta stays raw (bf16) here: the recurrent kernel sigmoids it in fp32
+        # Beta stays in the model dtype: the recurrent kernel sigmoids it in fp32
         # at load (SIGMOID_BETA), and only the chunked prefill path needs the
         # pre-computed fp32 sigmoid — computed lazily in _forward. Pure decode
         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
@@ -738,13 +766,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     v=_rearr(v_ns),
                     raw_g=g1_ns,
                     # Chunk path wants the pre-sigmoided fp32 beta (its
-                    # kernels don't sigmoid); beta_ns is raw bf16 from forward.
+                    # kernels don't sigmoid); beta_ns holds raw projection output.
                     beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
                     A_log=self.A_log,
                     g_bias=self.dt_bias,
                     initial_state=initial_state,
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=True,
+                    use_sm75_chunk_state_workspace=self.use_sm75_chunk_state_workspace,
                     cu_seqlens=non_spec_query_start_loc,
                     safe_gate=safe_gate,
                     lower_bound=lower_bound,

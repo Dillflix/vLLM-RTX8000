@@ -16,7 +16,10 @@ from vllm.platforms import current_platform
 if current_platform.is_rocm():
     from vllm.models.glm5next.amd.ops.third_party.kda import fused_recurrent_kda
 else:
-    from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
+    from vllm.models.glm5next.nvidia.ops.third_party.kda import (
+        chunk_kda_with_fused_gate,
+        fused_recurrent_kda,
+    )
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
@@ -55,16 +58,19 @@ def naive_recurrent_kda(
     return out, s
 
 
-def make_inputs(num_seqs: int, query_len: int, device: torch.device):
+def make_inputs(
+    num_seqs: int,
+    query_len: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+):
     """Token-strided q/k/v/beta as the decode path produces them: column
     slices of a merged `[T, q|k|v]` conv output and of the fused
     `[T, qkv|beta|f_a|g_a]` projection.
     """
     T, proj = num_seqs * query_len, H * D
-    qkv = torch.randn(T, 3 * proj, dtype=torch.bfloat16, device=device)
-    projected = torch.randn(
-        T, 3 * proj + H + 2 * D, dtype=torch.bfloat16, device=device
-    )
+    qkv = torch.randn(T, 3 * proj, dtype=dtype, device=device)
+    projected = torch.randn(T, 3 * proj + H + 2 * D, dtype=dtype, device=device)
     q, k, v = (x.view(1, T, H, D) for x in qkv.split(proj, dim=-1))
     beta = projected[:, 3 * proj : 3 * proj + H].unsqueeze(0)
     # (A size-1 token dim gets an arbitrary stride from `view`.)
@@ -73,7 +79,7 @@ def make_inputs(num_seqs: int, query_len: int, device: torch.device):
         q=q,
         k=k,
         v=v,
-        g=torch.randn(1, T, H, D, dtype=torch.bfloat16, device=device),
+        g=torch.randn(1, T, H, D, dtype=dtype, device=device),
         beta=beta,
         a_log=0.5 * torch.randn(H, dtype=torch.float32, device=device),
         g_bias=0.1 * torch.randn(H * D, dtype=torch.float32, device=device),
@@ -108,11 +114,14 @@ def run_kernel(inputs: dict, state: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize(
     ("num_seqs", "query_len"), [(1, 1), (7, 1), (3, 3)], ids=["1x1", "7x1", "3x3"]
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @torch.inference_mode()
-def test_fused_recurrent_kda_matches_reference(num_seqs: int, query_len: int):
+def test_fused_recurrent_kda_matches_reference(
+    num_seqs: int, query_len: int, dtype: torch.dtype
+):
     torch.manual_seed(0)
     device = torch.device("cuda")
-    inputs, state = make_inputs(num_seqs, query_len, device)
+    inputs, state = make_inputs(num_seqs, query_len, device, dtype)
     expected_state = state.clone()
     out = run_kernel(inputs, state)
 
@@ -144,13 +153,14 @@ def test_fused_recurrent_kda_matches_reference(num_seqs: int, query_len: int):
 @pytest.mark.parametrize(
     ("num_seqs", "query_len"), [(7, 1), (3, 3)], ids=["7x1", "3x3"]
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @torch.inference_mode()
 def test_fused_recurrent_kda_strided_inputs_bit_identical_to_contiguous(
-    num_seqs: int, query_len: int
+    num_seqs: int, query_len: int, dtype: torch.dtype
 ):
     torch.manual_seed(0)
     device = torch.device("cuda")
-    inputs, state = make_inputs(num_seqs, query_len, device)
+    inputs, state = make_inputs(num_seqs, query_len, device, dtype)
     for name in ("q", "k", "v", "beta"):
         assert not inputs[name].is_contiguous()
     contiguous = {
@@ -162,6 +172,56 @@ def test_fused_recurrent_kda_strided_inputs_bit_identical_to_contiguous(
     out = run_kernel(inputs, state)
     torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
     torch.testing.assert_close(state, state_ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA FP16 chunk path")
+@pytest.mark.parametrize("length", [17, 65, 129])
+@torch.inference_mode()
+def test_chunk_kda_fp16_matches_reference(length):
+    """Partial and multi-chunk prefills must preserve the FP32 recurrence."""
+    torch.manual_seed(0)
+    n, heads = 2, 4
+    shape = (1, n * length, heads, D)
+    q, k, v, g = (
+        torch.randn(shape, dtype=torch.float16, device="cuda") for _ in range(4)
+    )
+    beta = torch.randn(1, n * length, heads, dtype=torch.float16, device="cuda")
+    a_log = 0.5 * torch.randn(heads, device="cuda")
+    g_bias = 0.1 * torch.randn(heads, D, device="cuda")
+    initial = torch.randn(n, heads, D, D, device="cuda")
+    expected = torch.empty_like(v[0], dtype=torch.float32)
+    expected_state = torch.empty_like(initial)
+    for seq in range(n):
+        tok = slice(seq * length, (seq + 1) * length)
+        expected[tok], expected_state[seq] = naive_recurrent_kda(
+            q[0, tok],
+            k[0, tok],
+            v[0, tok],
+            g[0, tok],
+            beta[0, tok],
+            a_log,
+            g_bias,
+            initial[seq],
+        )
+    actual, state = chunk_kda_with_fused_gate(
+        q=q,
+        k=k,
+        v=v.clone(),
+        raw_g=g,
+        beta=beta.float().sigmoid(),
+        A_log=a_log,
+        g_bias=g_bias.flatten(),
+        initial_state=initial,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=torch.arange(
+            0, n * length + 1, length, dtype=torch.int32, device="cuda"
+        ),
+        safe_gate=True,
+        lower_bound=LOWER_BOUND,
+    )
+    torch.testing.assert_close(actual[0].float(), expected, rtol=1e-2, atol=1e-3)
+    torch.testing.assert_close(state, expected_state, rtol=1e-2, atol=1e-3)
 
 
 @pytest.mark.skipif(

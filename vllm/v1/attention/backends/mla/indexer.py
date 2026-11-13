@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -433,6 +434,9 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     max_local_total_seq_lens: int = 0
 
     pcp_deinterleave_idx: torch.Tensor | None = None
+    # Original planner chunk size, before a smaller SM75 gather reservation
+    # splits its request group. Preserve the existing key-format dispatch.
+    sm75_legacy_chunk_rows: int | None = None
 
 
 class BuildPrefillChunkMetadataKernel(
@@ -892,6 +896,49 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         )
 
 
+def sm75_glm_request_gather_rows(
+    vllm_config: VllmConfig | None, compression: int
+) -> int | None:
+    """Optional logical gather budget shared by metadata and runtime owners."""
+    enabled = (
+        cast(dict[str, Any], vllm_config.additional_config).get(
+            "glm_sm75_request_gather_bound", False
+        )
+        if vllm_config is not None
+        else False
+    )
+    if type(enabled) is not bool:
+        raise ValueError("glm_sm75_request_gather_bound must be a boolean")
+    if not enabled:
+        return None
+    assert vllm_config is not None
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    cfg = model.hf_text_config if model is not None else None
+    if (
+        not current_platform.is_device_capability(75)
+        or model is None
+        or model.dtype != torch.float16
+        or getattr(cfg, "model_type", None) != "glm5_next_text"
+        or getattr(cfg, "index_head_dim", None) != 128
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+        or dsa_indexer_uses_fp4(vllm_config)
+    ):
+        raise ValueError(
+            "glm_sm75_request_gather_bound requires SM75 FP16 GLM "
+            "with 128-wide FP8 index keys and PCP=DCP=1"
+        )
+    if compression == 1:
+        # The uncompressed tail cache uses this metadata builder too.
+        return None
+    if type(compression) is not int or compression < 2:
+        raise ValueError("Request gather bound requires a compressed index cache")
+    if compression != getattr(cfg, "index_kpool", None):
+        raise ValueError("Index cache compression differs from the GLM model")
+    return (model.max_model_len + compression - 1) // compression
+
+
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     max_model_len = vllm_config.model_config.max_model_len
     factor = vllm_config.attention_config.sparse_mla_prefill_workspace_factor
@@ -979,6 +1026,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # so this is None; its own split uses self.decode_threshold.
     reorder_batch_threshold: int | None = None
     requires_block_table_width = True
+    use_sm75_glm_mqa: bool = False
 
     @classmethod
     def get_cudagraph_support(
@@ -1025,6 +1073,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.max_prefill_buffer_size = (
             get_max_prefill_buffer_size(self.vllm_config) // self.compress_ratio
         )
+        self.sm75_legacy_prefill_buffer_size = self.max_prefill_buffer_size
+        self.sm75_request_gather_rows = sm75_glm_request_gather_rows(
+            self.vllm_config, self.compress_ratio
+        )
+        if self.sm75_request_gather_rows is not None:
+            if self.use_shardq:
+                raise ValueError("Request gather bound does not support shard-Q")
+            self.max_prefill_buffer_size = min(
+                self.max_prefill_buffer_size, self.sm75_request_gather_rows
+            )
         self.num_speculative_tokens = (
             self.vllm_config.speculative_config.num_speculative_tokens
             if self.vllm_config.speculative_config
@@ -1043,6 +1101,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # chunks.
         model_config = self.vllm_config.model_config
         cfg = model_config.hf_text_config if model_config is not None else None
+        self.use_sm75_glm_mqa = (
+            current_platform.is_device_capability(75)
+            and getattr(cfg, "model_type", None) == "glm5_next_text"
+        )
         self.fused_mqa_topk_eligible = cfg is not None and use_fused_mqa_topk(
             query_shape=(
                 getattr(cfg, "index_n_heads", 0),
@@ -1396,6 +1458,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         max_logits_bytes: int,
         request_offset: int = 0,
         fused_mqa_topk_eligible: bool = False,
+        strict_workspace_size: bool = False,
     ) -> list[tuple[slice, slice]]:
         """Split this step's prefill requests into chunks, respecting:
         - N constraint: total_seq_lens <= workspace_size (existing O(N)
@@ -1414,6 +1477,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         Returns list of (req_slice, query_slice) tuples.
         """
+        if strict_workspace_size and (
+            workspace_size <= 0
+            or bool(torch.any(compressed_seq_lens_cpu > workspace_size))
+        ):
+            raise ValueError("A request exceeds the bounded indexer gather workspace")
         chunks: list[tuple[slice, slice]] = []
         n = len(compressed_seq_lens_cpu)
         max_logits_elems = max_logits_bytes // 4
@@ -1464,6 +1532,51 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 chunks.append((req_slice, slice(q_off, q_off + sub_m)))
 
         return chunks
+
+    @staticmethod
+    def _preserve_prefill_chunk_rows(
+        chunk_specs: list[tuple[slice, slice]],
+        legacy_specs: list[tuple[slice, slice]],
+        prefill_query_lens_cpu: torch.Tensor,
+        request_offset: int = 0,
+    ) -> list[tuple[slice, slice, int]]:
+        """Intersect bounded chunks with the original key-format row spans.
+
+        The legacy dispatch uses the full planned query slice, before any
+        dense-logits subcalls. Splitting at its boundaries preserves that
+        choice without increasing the bounded request group's gathered keys.
+        """
+        query_starts = [0]
+        for count in prefill_query_lens_cpu.tolist():
+            query_starts.append(query_starts[-1] + count)
+        legacy_spans = [
+            (
+                query_starts[requests.start - request_offset] + rows.start,
+                query_starts[requests.start - request_offset] + rows.stop,
+                rows.stop - rows.start,
+            )
+            for requests, rows in legacy_specs
+        ]
+        result = []
+        old_index = 0
+        for requests, rows in chunk_specs:
+            base = query_starts[requests.start - request_offset]
+            cursor, stop = base + rows.start, base + rows.stop
+            while cursor < stop:
+                while (
+                    old_index < len(legacy_spans)
+                    and legacy_spans[old_index][1] <= cursor
+                ):
+                    old_index += 1
+                if old_index == len(legacy_spans):
+                    raise RuntimeError("Legacy indexer chunks do not cover query rows")
+                old_start, old_stop, old_rows = legacy_spans[old_index]
+                if not old_start <= cursor < old_stop:
+                    raise RuntimeError("Legacy indexer chunks contain a query gap")
+                end = min(stop, old_stop)
+                result.append((requests, slice(cursor - base, end - base), old_rows))
+                cursor = end
+        return result
 
     def build(
         self,
@@ -1634,10 +1747,26 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     max_logits_bytes,
                     request_offset=num_decodes,
                     fused_mqa_topk_eligible=self.fused_mqa_topk_eligible,
+                    strict_workspace_size=self.sm75_request_gather_rows is not None,
                 )
 
+            planned_chunks: Sequence[tuple[slice, slice, int | None]] = [
+                (r, q, None) for r, q in chunk_specs
+            ]
+            if self.sm75_request_gather_rows is not None:
+                legacy_specs = self._split_indexer_prefill_chunks(
+                    self._prefill_split_seq_lens(compressed_seq_lens_cpu[num_decodes:]),
+                    prefill_query_lens_cpu,
+                    self.sm75_legacy_prefill_buffer_size,
+                    max_logits_bytes,
+                    request_offset=num_decodes,
+                    fused_mqa_topk_eligible=self.fused_mqa_topk_eligible,
+                )
+                planned_chunks = self._preserve_prefill_chunk_rows(
+                    chunk_specs, legacy_specs, prefill_query_lens_cpu, num_decodes
+                )
             chunks = []
-            for req_slice, query_slice in chunk_specs:
+            for req_slice, query_slice, legacy_rows in planned_chunks:
                 pcp_plan = None
                 if req_idx is not None:
                     assert shard_rows is not None
@@ -1668,6 +1797,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
+                    metadata.sm75_legacy_chunk_rows = legacy_rows
                     chunks.append(metadata)
             prefill_metadata = DeepseekV32IndexerPrefillMetadata(
                 chunks,
@@ -1835,9 +1965,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
+            # GLM's SM75 implementation schedules its own paged logits work.
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and not self.use_sm75_glm_mqa
+                and has_deep_gemm()
+            ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,
@@ -1920,7 +2054,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode.seq_lens.view(-1).copy_(metadata.seq_lens)
         decode.decode_lens.fill_(1)
 
-        if current_platform.is_cuda() and has_deep_gemm():
+        if current_platform.is_cuda() and not self.use_sm75_glm_mqa and has_deep_gemm():
             schedule_metadata = get_paged_mqa_logits_metadata(
                 decode.seq_lens,
                 self.kv_cache_spec.num_states,

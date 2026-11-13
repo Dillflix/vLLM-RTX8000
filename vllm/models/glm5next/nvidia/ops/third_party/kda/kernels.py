@@ -900,6 +900,47 @@ def fused_kda_gate_chunk_cumsum(
     return y
 
 
+def _sm75_chunk_state_workspace(
+    k, u, chunk_indices, chunk_size, live_inputs, *, enabled: bool = False
+):
+    if type(enabled) is not bool:
+        raise ValueError("glm_sm75_kda_scratch must be a boolean")
+    if not enabled:
+        return None
+    from vllm.platforms import current_platform
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    # Model/configuration guards run once in the owning KDA constructor.
+    # Keep actual tensor/device/alias guards here for every invocation.
+    if (
+        not current_platform.is_device_capability(75)
+        or k.dtype != torch.float16
+        or k.ndim != 4
+        or k.shape[0] != 1
+        or k.shape[-2:] != (32, 128)
+        or u.shape[-2:] != (32, 128)
+        or u.dtype != k.dtype
+        or u.device != k.device
+    ):
+        raise ValueError("KDA scratch requires SM75 FP16 H32/D128 tensors")
+    b, t, _, width = k.shape
+    chunks = len(chunk_indices) if chunk_indices is not None else cdiv(t, chunk_size)
+    shape = (b, chunks, u.shape[-2], u.shape[-1], width)
+    (scratch,) = current_workspace_manager().get_simultaneous((shape, k.dtype))
+    if scratch.device != k.device:
+        raise ValueError("KDA scratch arena is on a different device")
+    # The active Triton KDA path otherwise uses independent tensor allocations.
+    # Preserve an exceptional caller's arena-backed inputs through the original
+    # allocation path. The qualification inventory must show no such fallback
+    # in the served model before claiming a memory saving.
+    if any(
+        value is not None and torch._C._overlaps(scratch, value)
+        for value in live_inputs
+    ):
+        return None
+    return scratch
+
+
 def _chunk_kda_fwd_with_cumulative_g(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -912,6 +953,7 @@ def _chunk_kda_fwd_with_cumulative_g(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
+    use_sm75_chunk_state_workspace: bool = False,
 ):
     # `g` must already be chunk-local cumulatively-summed AND scaled by
     # RCP_LN2 (so the downstream exp2-based kernels reproduce exp(g)).
@@ -941,6 +983,14 @@ def _chunk_kda_fwd_with_cumulative_g(
         chunk_indices=chunk_indices,
     )
     del A
+    h_workspace = _sm75_chunk_state_workspace(
+        kg,
+        u,
+        chunk_indices,
+        chunk_size,
+        (q, k, v, g, beta, Aqk, w, u, kg, initial_state, cu_seqlens, chunk_indices),
+        enabled=use_sm75_chunk_state_workspace,
+    )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
@@ -951,6 +1001,7 @@ def _chunk_kda_fwd_with_cumulative_g(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
+        h_out=h_workspace,
     )
     del w, u, kg
     o = chunk_gla_fwd_o_gk(
@@ -1024,6 +1075,7 @@ def chunk_kda_with_fused_gate_fwd(
     cu_seqlens: torch.Tensor | None = None,
     safe_gate: bool = False,
     lower_bound: float = -5.0,
+    use_sm75_chunk_state_workspace: bool = False,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1053,6 +1105,7 @@ def chunk_kda_with_fused_gate_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        use_sm75_chunk_state_workspace=use_sm75_chunk_state_workspace,
     )
 
 
@@ -1105,6 +1158,7 @@ def chunk_kda_with_fused_gate(
     cu_seqlens: torch.Tensor | None = None,
     safe_gate: bool = False,
     lower_bound: float = -5.0,
+    use_sm75_chunk_state_workspace: bool = False,
     **kwargs,
 ):
     """Run chunk KDA from raw gate projection using fused gate+cumsum."""
@@ -1129,6 +1183,7 @@ def chunk_kda_with_fused_gate(
         cu_seqlens=cu_seqlens,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
+        use_sm75_chunk_state_workspace=use_sm75_chunk_state_workspace,
     )
     return o, final_state
 

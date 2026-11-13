@@ -92,6 +92,10 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "FlashInferMLASparseSM90Backend"
     )
     TRITON_MLA = "vllm.v1.attention.backends.mla.triton_mla.TritonMLABackend"
+    TRITON_MLA_SPARSE_SM75 = (
+        "vllm.v1.attention.backends.mla.triton_mla_sparse_sm75."
+        "TritonMLASparseSM75Backend"
+    )
     CUTLASS_MLA = "vllm.v1.attention.backends.mla.cutlass_mla.CutlassMLABackend"
     FLASHMLA = "vllm.v1.attention.backends.mla.flashmla.FlashMLABackend"
     FLASHMLA_SPARSE = (

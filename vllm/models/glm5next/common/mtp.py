@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 import typing
 from collections.abc import Callable, Iterable
+from typing import Any, cast
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
@@ -25,6 +27,7 @@ from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
 from vllm.model_executor.models.utils import (
     extract_layer_index,
+    get_draft_quant_config,
     get_fused_shared_expert_layers,
     maybe_prefix,
 )
@@ -43,6 +46,19 @@ from .model import (
     get_sparse_topk_buffer_width,
     get_spec_layer_idx_from_weight_name,
 )
+
+
+def _load_base_mtp_embedding(
+    name: str,
+    weight: torch.Tensor,
+    params: dict[str, torch.Tensor],
+) -> bool:
+    if name != "model.embed_tokens.weight":
+        return False
+    param = params[name]
+    loader = getattr(param, "weight_loader", default_weight_loader)
+    loader(param, weight)
+    return True
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
@@ -126,7 +142,23 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                 )
             }
         )
-        self.embed_tokens = VocabParallelEmbedding(
+        self.glm_sm75_lossless_embedding = cast(
+            dict[str, Any], vllm_config.additional_config
+        ).get("glm_sm75_lossless_embedding", False)
+        if type(self.glm_sm75_lossless_embedding) is not bool:
+            raise ValueError("glm_sm75_lossless_embedding must be a boolean")
+        embedding_factory: Callable[..., VocabParallelEmbedding] = (
+            VocabParallelEmbedding
+        )
+        if self.glm_sm75_lossless_embedding:
+            from functools import partial
+
+            from vllm.models.glm5next.nvidia.ops.embedding_lossless_sm75 import (
+                make_embedding,
+            )
+
+            embedding_factory = partial(make_embedding, vllm_config)
+        self.embed_tokens = embedding_factory(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
@@ -207,8 +239,42 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    # The target embedding exists only on the first PP stage; this drafter runs
+    # on the last stage and loads its own TP shard from the base checkpoint.
+    has_own_embed_tokens = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        assert speculative_config.draft_model_config is not None
+        # The loader passes the target config. A separate draft checkpoint can
+        # quantize layers that the target excludes, including the MTP experts.
+        vllm_config = copy.copy(vllm_config)
+        vllm_config.model_config = speculative_config.draft_model_config
+        vllm_config.quant_config = get_draft_quant_config(vllm_config)
+        if (
+            cast(dict[str, Any], vllm_config.additional_config).get(
+                "glm_sm75_int8_outputs"
+            )
+            is True
+        ):
+            # The separate MTP artifact retains its original output projection.
+            # Keep the target-only INT8 overlay out of the draft constructor.
+            vllm_config.additional_config = {
+                **cast(dict[str, Any], vllm_config.additional_config),
+                "glm_sm75_int8_outputs": False,
+            }
+        self.glm_native_dense_mtp = False
+        self.glm_native_dense_installed: list[dict] = []
+        if "glm_native_dense_mtp" in cast(
+            dict[str, Any], vllm_config.additional_config
+        ):
+            from vllm.models.glm5next.nvidia.ops.dense_sm75 import (
+                validate_mtp_configuration,
+            )
+
+            self.glm_native_dense_mtp = validate_mtp_configuration(vllm_config)
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         )
@@ -337,6 +403,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            if _load_base_mtp_embedding(name, loaded_weight, params_dict):
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -439,8 +508,24 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        if "model.embed_tokens.weight" not in loaded_params:
+            raise ValueError(
+                "GLM MTP requires base embed_tokens weights on its pipeline stage"
+            )
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
         for mlp in self.moe_mlp_layers:
             mlp.finalize_mega_moe_weights()
+        if self.glm_native_dense_mtp:
+            from vllm.models.glm5next.nvidia.ops.dense_sm75 import install_mtp_draft
+
+            installed = install_mtp_draft(self)
+            if installed:
+                self.glm_native_dense_installed = installed
+        if self.model.glm_sm75_lossless_embedding:
+            from vllm.models.glm5next.nvidia.ops.embedding_lossless_sm75 import (
+                install as install_lossless_embedding,
+            )
+
+            self.glm_lossless_embedding_installed = install_lossless_embedding(self)

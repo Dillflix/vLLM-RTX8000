@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
+from typing import Any, cast
 
 import torch
 
@@ -8,6 +9,7 @@ import torch
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm._aiter_ops import is_aiter_found_and_supported
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
@@ -104,6 +106,76 @@ def _apply_mhc_norm(
     return ir.ops.rms_norm(layer_input, norm_weight, norm_eps)
 
 
+def _use_turing_mhc_reference(residual: torch.Tensor) -> bool:
+    # TileLang's mHC kernels require BF16, which Turing cannot compute natively.
+    return residual.dtype == torch.float16 and current_platform.is_device_capability(75)
+
+
+def _turing_mhc_requested() -> bool:
+    config = get_current_vllm_config_or_none()
+    backend = (
+        cast(dict[str, Any], config.additional_config).get("glm_mhc_backend", "torch")
+        if config is not None
+        else "torch"
+    )
+    if backend not in ("torch", "turing"):
+        raise ValueError("glm_mhc_backend must be 'torch' or 'turing'")
+    if backend == "torch":
+        return False
+    if not current_platform.is_cuda() or not current_platform.is_device_capability(75):
+        raise ValueError("glm_mhc_backend='turing' requires SM75 CUDA GPUs")
+    assert config is not None
+    model = config.model_config
+    if model is not None:
+        hf = model.hf_text_config
+        if model.dtype != torch.float16:
+            raise ValueError("glm_mhc_backend='turing' requires --dtype float16")
+        if getattr(hf, "model_type", None) != "glm5_next_text" or hf.hc_mult != 4:
+            raise ValueError("glm_mhc_backend='turing' requires four-stream GLM mHC")
+    return True
+
+
+def _turing_mhc_post_workspace_tokens(turing_selected: bool) -> int:
+    """Read the optional policy only while constructing the model-owned op."""
+    cfg = get_current_vllm_config_or_none()
+    enabled = (
+        cast(dict[str, Any], cfg.additional_config).get(
+            "glm_sm75_mhc_post_workspace", False
+        )
+        if cfg is not None and isinstance(cfg.additional_config, dict)
+        else False
+    )
+    if type(enabled) is not bool:
+        raise ValueError("glm_sm75_mhc_post_workspace must be a boolean")
+    if not enabled:
+        return 0
+    assert cfg is not None
+    parallel = cfg.parallel_config
+    if (
+        not turing_selected
+        or not current_platform.is_device_capability(75)
+        or cfg.model_config.dtype != torch.float16
+        or cfg.model_config.hf_text_config.model_type != "glm5_next_text"
+        or cfg.model_config.hf_text_config.hc_mult != 4
+        or cfg.model_config.hf_text_config.hidden_size != 4096
+        or parallel.tensor_parallel_size != 2
+        or parallel.pipeline_parallel_size != 2
+        or parallel.data_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+        or parallel.enable_dbo
+        or parallel.ubatch_size > 1
+        or cfg.offload_config.uva.cpu_offload_gb != 0
+        or cfg.offload_config.prefetch.offload_group_size != 0
+        or cfg.compilation_config.mode != 0
+    ):
+        raise ValueError(
+            "mHC post workspace requires Turing FP16 GLM H4096/four streams, "
+            "TP2/PP2, PCP=DCP=1, mode0 and no offload/DBO"
+        )
+    return cfg.scheduler_config.max_num_batched_tokens
+
+
 # --8<-- [start:mhc_pre]
 @CustomOp.register("mhc_pre")
 class MHCPreOp(CustomOp):
@@ -115,6 +187,14 @@ class MHCPreOp(CustomOp):
     """
 
     # --8<-- [end:mhc_pre]
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._turing_pre = None
+        if _turing_mhc_requested():
+            from vllm.model_executor.kernels.mhc.turing import mhc_pre_turing
+
+            self._turing_pre = mhc_pre_turing
+
     @classmethod
     def enabled(cls) -> bool:
         return True
@@ -134,6 +214,38 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._turing_pre is not None:
+            return self._turing_pre(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+        if _use_turing_mhc_reference(residual):
+            post_mix, comb_mix, layer_input = self.forward_native(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+            )
+            return (
+                post_mix,
+                comb_mix,
+                _apply_mhc_norm(layer_input, norm_weight, norm_eps),
+            )
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
@@ -570,6 +682,14 @@ class MHCPostOp(CustomOp):
 
     # --8<-- [end:mhc_post]
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._turing_post = None
+        if _turing_mhc_requested():
+            from vllm.model_executor.kernels.mhc.turing import mhc_post_turing
+
+            self._turing_post = mhc_post_turing
+
     @classmethod
     def enabled(cls) -> bool:
         return True
@@ -581,6 +701,10 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if self._turing_post is not None:
+            return self._turing_post(x, residual, post_layer_mix, comb_res_mix)
+        if _use_turing_mhc_reference(residual):
+            return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
         )
@@ -775,6 +899,17 @@ class MHCFusedPostPreOp(CustomOp):
     """
 
     # --8<-- [end:mhc_fused_post_pre]
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._turing_post_pre = None
+        if _turing_mhc_requested():
+            from vllm.model_executor.kernels.mhc.turing import mhc_fused_post_pre_turing
+
+            self._turing_post_pre = mhc_fused_post_pre_turing
+        self._turing_post_workspace_tokens = _turing_mhc_post_workspace_tokens(
+            self._turing_post_pre is not None
+        )
+
     @classmethod
     def enabled(cls) -> bool:
         return True
@@ -798,6 +933,47 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._turing_post_pre is not None:
+            return self._turing_post_pre(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                post_workspace_tokens=self._turing_post_workspace_tokens,
+            )
+        if _use_turing_mhc_reference(residual):
+            residual_cur, post_mix, comb_mix, layer_input = self.forward_native(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+            )
+            return (
+                residual_cur,
+                post_mix,
+                comb_mix,
+                _apply_mhc_norm(layer_input, norm_weight, norm_eps),
+            )
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,

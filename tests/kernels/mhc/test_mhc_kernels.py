@@ -22,6 +22,7 @@ from vllm.model_executor.kernels.mhc.tilelang_kernels import (
 from vllm.model_executor.kernels.mhc.torch import (
     mhc_post_torch,
     mhc_pre_delayed_torch,
+    mhc_pre_torch,
 )
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.mhc import (
@@ -32,6 +33,7 @@ from vllm.model_executor.layers.mhc import (
     HAS_AITER_MHC_PRE_NORM,
     HAS_TILELANG_MHC,
     MHCFusedPostPreOp,
+    MHCPostOp,
     MHCPreDelayedOp,
     MHCPreOp,
 )
@@ -918,7 +920,7 @@ def mhc_pre_ref(
         res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
     )
 
-    layer_input = (residual * pre_mix).sum(-2).bfloat16()
+    layer_input = (residual * pre_mix).sum(-2).to(residual.dtype)
 
     return post_mix, res_mix, layer_input
 
@@ -931,7 +933,166 @@ def mhc_post_ref(
 ) -> torch.Tensor:
     """MHC post reference kernel from tilelang repo: https://github.com/tile-ai/tilelang/blob/d135bd1cd2d2eee74fbb41dd0a0831a427194c86/examples/deepseek_mhc/example_mhc_post.py#L68."""
     term2 = torch.bmm(comb_res_mix.mT, residual.float())
-    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).to(residual.dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens,hidden_size", [(1, 256), (7, 4096)])
+def test_mhc_reference_preserves_activation_dtype_and_fp32_gates(
+    dtype, num_tokens, hidden_size
+):
+    """FP16 mHC must retain FP32 gates and the existing BF16 math."""
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    residual = torch.randn(
+        num_tokens, 4, hidden_size, generator=generator, device="cpu"
+    ).to(dtype)
+    # Zero logits have an exact closed form: pre=1/2, post=1, comb=1/4.
+    fn = torch.zeros(24, 4 * hidden_size, device="cpu")
+    scale = torch.ones(3, device="cpu")
+    base = torch.zeros(24, device="cpu")
+    args = (residual, fn, scale, base, 1e-6, 0.0, 0.0, 2.0, 20)
+    actual = mhc_pre_torch(*args)
+    expected = mhc_pre_ref(*args)
+    assert actual[0].dtype == actual[1].dtype == torch.float32
+    assert actual[2].dtype == dtype
+    for result, ref in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, ref, atol=0, rtol=0)
+
+    x = torch.randn(num_tokens, hidden_size, generator=generator, device="cpu").to(
+        dtype
+    )
+    result = mhc_post_torch(x, residual, actual[0], actual[1])
+    expected_post = mhc_post_ref(x, residual, actual[0], actual[1])
+    assert result.dtype == dtype
+    torch.testing.assert_close(result, expected_post, atol=0, rtol=0)
+
+
+def test_mhc_fp16_mixing_does_not_overflow_before_cancellation():
+    """Intermediate sums can exceed FP16 range while the result is finite."""
+    residual = torch.full((1, 4, 16), 40000.0, dtype=torch.float16, device="cpu")
+    x = torch.full((1, 16), -40000.0, dtype=torch.float16, device="cpu")
+    post = torch.full((1, 4, 1), 2.0, device="cpu")
+    comb = torch.full((1, 4, 4), 0.5, device="cpu")
+    result = mhc_post_torch(x, residual, post, comb)
+    torch.testing.assert_close(result, torch.zeros_like(result), atol=0, rtol=0)
+
+    residual[:, 2:].neg_()
+    _, _, layer_input = mhc_pre_torch(
+        residual,
+        torch.zeros(24, 64, device="cpu"),
+        torch.ones(3, device="cpu"),
+        torch.zeros(24, device="cpu"),
+        1e-6,
+        0.0,
+        1e-6,
+        2.0,
+        20,
+    )
+    torch.testing.assert_close(
+        layer_input, torch.zeros_like(layer_input), atol=0, rtol=0
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(75),
+    reason="SM75 FP16 mHC fallback requires Turing",
+)
+@pytest.mark.parametrize("num_tokens", [1, 7, 2048])
+@pytest.mark.parametrize("fused_norm", [False, True])
+@pytest.mark.parametrize("backend", ["torch", "turing"])
+def test_mhc_turing_fp16_dispatch(default_vllm_config, num_tokens, fused_norm, backend):
+    """Exercise real SM75 dispatch, including the model's fused RMSNorm seam."""
+    default_vllm_config.additional_config["glm_mhc_backend"] = backend
+    set_random_seed(0)
+    hidden_size = 4096
+    residual = torch.randn(
+        num_tokens, 4, hidden_size, dtype=torch.float16, device="cuda"
+    )
+    fn = torch.randn(24, 4 * hidden_size, device="cuda") * 1e-4
+    scale = torch.tensor([0.5, 0.25, 0.75], device="cuda")
+    base = torch.randn(24, device="cuda") * 0.1
+    mix_args = (fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 20)
+    weight = (
+        torch.randn(hidden_size, dtype=torch.float16, device="cuda")
+        if fused_norm
+        else None
+    )
+
+    def normalized(x):
+        if weight is None:
+            return x
+        x32 = x.float()
+        return (x32 * torch.rsqrt(x32.square().mean(-1, keepdim=True) + 1e-6)).to(
+            x.dtype
+        ) * weight
+
+    expected = mhc_pre_ref(residual, *mix_args)
+    actual = MHCPreOp()(residual, *mix_args, norm_weight=weight, norm_eps=1e-6)
+    for result, ref in zip(actual[:2], expected[:2], strict=True):
+        assert result.dtype == torch.float32
+        torch.testing.assert_close(result, ref)
+    if backend == "turing":
+        # Tiny comb errors accumulate through the deferred inter-layer seam.
+        torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
+    assert actual[2].dtype == torch.float16
+    torch.testing.assert_close(actual[2], normalized(expected[2]))
+
+    x = torch.randn(num_tokens, hidden_size, dtype=torch.float16, device="cuda")
+    residual_ref = mhc_post_ref(x, residual, expected[0], expected[1])
+    post = MHCPostOp()(x, residual, expected[0], expected[1])
+    torch.testing.assert_close(post, residual_ref)
+    expected_next = mhc_pre_ref(residual_ref, *mix_args)
+    fused = MHCFusedPostPreOp()(
+        x,
+        residual,
+        expected[0],
+        expected[1],
+        *mix_args,
+        norm_weight=weight,
+        norm_eps=1e-6,
+    )
+    torch.testing.assert_close(fused[0], residual_ref)
+    for result, ref in zip(fused[1:3], expected_next[:2], strict=True):
+        assert result.dtype == torch.float32
+        torch.testing.assert_close(result, ref)
+    if backend == "turing":
+        torch.testing.assert_close(fused[2], expected_next[1], atol=0, rtol=0)
+    assert fused[3].dtype == torch.float16
+    torch.testing.assert_close(fused[3], normalized(expected_next[2]))
+
+    if backend == "turing" and num_tokens == 1 and fused_norm:
+        op = MHCFusedPostPreOp()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = op(
+                x,
+                residual,
+                expected[0],
+                expected[1],
+                *mix_args,
+                norm_weight=weight,
+                norm_eps=1e-6,
+            )
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        updated = op(
+            x,
+            residual,
+            expected[0],
+            expected[1],
+            *mix_args,
+            norm_weight=weight,
+            norm_eps=1e-6,
+        )
+        for got, want in zip(captured, updated, strict=True):
+            torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("op", [MHCPreOp, MHCPostOp, MHCFusedPostPreOp])
+def test_mhc_rejects_unknown_glm_backend(default_vllm_config, op):
+    default_vllm_config.additional_config["glm_mhc_backend"] = "fp16"
+    with pytest.raises(ValueError, match="glm_mhc_backend must be"):
+        op()
 
 
 def hc_head_ref(
@@ -2158,3 +2319,54 @@ def test_hc_expand_preserves_bits_in_eager_and_graph(
     x.copy_(torch.randn_like(x))
     graph.replay()
     check(captured)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(75),
+    reason="SM75 FP16 mHC fusion requires Turing",
+)
+@pytest.mark.parametrize("tokens", [0, 1, 5, 512, 2048])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_turing_fused_mhc_preserves_fp32_projection(tokens, with_norm):
+    """Compare the optional fused kernels with the existing FP32 reference."""
+    from vllm.model_executor.kernels.mhc.turing import (
+        mhc_fused_post_pre_turing,
+        mhc_post_turing,
+        mhc_pre_turing,
+    )
+
+    torch.manual_seed(95)
+    hidden = 4096
+    residual = torch.randn(tokens, 4, hidden, device="cuda", dtype=torch.float16)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.float16)
+    fn = torch.randn(24, 4 * hidden, device="cuda", dtype=torch.float32) * 0.01
+    scale = torch.tensor([0.2, 0.3, 0.4], device="cuda", dtype=torch.float32)
+    base = torch.randn(24, device="cuda", dtype=torch.float32) * 0.1
+    post = torch.rand(tokens, 4, 1, device="cuda", dtype=torch.float32)
+    comb = torch.rand(tokens, 4, 4, device="cuda", dtype=torch.float32)
+    norm = torch.rand(hidden, device="cuda", dtype=torch.float16) if with_norm else None
+    args = (fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 20)
+
+    def reference_pre(r):
+        p, c, out = mhc_pre_torch(r, *args)
+        if norm is not None:
+            value = out.float()
+            value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+            out = value.half() * norm
+        return p, c, out
+
+    expected_current = mhc_post_torch(x, residual, post, comb)
+    actual_current = mhc_post_turing(x, residual, post, comb)
+    torch.testing.assert_close(actual_current, expected_current, atol=1e-3, rtol=1e-3)
+    actual = mhc_pre_turing(residual, *args, norm_weight=norm, norm_eps=1e-6)
+    expected = reference_pre(residual)
+    for got, want in zip(actual, expected, strict=True):
+        tol = 1e-3 if got.dtype == torch.float16 else 1e-5
+        torch.testing.assert_close(got, want, atol=tol, rtol=tol)
+    fused = mhc_fused_post_pre_turing(
+        x, residual, post, comb, *args, norm_weight=norm, norm_eps=1e-6
+    )
+    expected = (expected_current, *reference_pre(expected_current))
+    for got, want in zip(fused, expected, strict=True):
+        tol = 1e-3 if got.dtype == torch.float16 else 1e-5
+        torch.testing.assert_close(got, want, atol=tol, rtol=tol)

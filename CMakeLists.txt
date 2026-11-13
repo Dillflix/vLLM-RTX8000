@@ -549,20 +549,25 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(RTX8000_ARCHS)
       include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/rtx8000/qsa_variants.cmake")
       include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/rtx8000/dense_mma_variants.cmake")
+      include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/rtx8000/dense_gemv_extra_variants.cmake")
       set(RTX8000_KERNEL_SRC "csrc/rtx8000/qsa.cu" "csrc/rtx8000/dense.cu"
         "csrc/rtx8000/gdn_o_q16.cu" "csrc/rtx8000/gdn_o_q32.cu"
         "csrc/rtx8000/dense_mma.cu"
+        "csrc/rtx8000/lossless_head_tile.cu"
         "csrc/rtx8000/gdn_h_v8.cu" "csrc/rtx8000/gdn_h_v16.cu"
-        ${RTX8000_QSA_SOURCES} ${RTX8000_DENSE_MMA_SOURCES})
+        ${RTX8000_QSA_SOURCES} ${RTX8000_DENSE_MMA_SOURCES}
+        ${RTX8000_DENSE_GEMV_EXTRA_SOURCES})
       set_gencode_flags_for_srcs(SRCS "${RTX8000_KERNEL_SRC}" CUDA_ARCHS "${RTX8000_ARCHS}")
       define_extension_target(_rtx8000_C DESTINATION vllm LANGUAGE CUDA
         SOURCES csrc/rtx8000/torch_bindings.cpp
           csrc/rtx8000/gdn_o_bindings.cpp csrc/rtx8000/gdn_h_bindings.cpp
+          csrc/rtx8000/lossless_head_bindings.cpp
           ${RTX8000_KERNEL_SRC}
         COMPILE_FLAGS ${VLLM_GPU_FLAGS} ARCHITECTURES 75
         USE_SABI 3.9 WITH_SOABI)
       target_include_directories(_rtx8000_C PRIVATE ${cutlass_SOURCE_DIR}/include)
       set_target_properties(_rtx8000_C PROPERTIES CXX_STANDARD 20)
+      include("${CMAKE_CURRENT_SOURCE_DIR}/csrc/rtx8000/native_indexer.cmake")
     else()
       add_custom_target(_rtx8000_C)
     endif()

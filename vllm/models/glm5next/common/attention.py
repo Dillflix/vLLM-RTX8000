@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any, cast
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -30,7 +32,10 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition, refill_derived
-from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
+from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+    fwht128_fp16,
+    fwht128_quant_fp8,
+)
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, next_power_of_2
@@ -61,10 +66,12 @@ def _fused_indexer_k_norm(
 
 @torch.compile(**_INDEXER_COMPILE)
 def _fused_indexer_weight_scale(
-    weights: torch.Tensor, q_scale: torch.Tensor, scale: float
+    weights: torch.Tensor, q_scale: torch.Tensor | None, scale: float
 ) -> torch.Tensor:
     # Fuse the weight-scaling muls (was 2 kernels) into one. `scale` folds
     # softmax_scale (head_dim**-0.5) and n_head**-0.5 into a single constant.
+    if q_scale is None:
+        return weights * scale
     return (weights.unsqueeze(-1) * q_scale * scale).squeeze(-1)
 
 
@@ -133,8 +140,8 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
     no-prune, 1-block/req allocation that lets the in-progress pool survive
     across steps and across transfer.
 
-    Stores raw bf16 K (`head_dim`) as the "K" half of each block and the
-    bf16 gate score (`head_dim`) as the "V" half -- not the fp8-compressed
+    Stores raw model-dtype K (`head_dim`) as the "K" half of each block and the
+    gate score (`head_dim`) as the "V" half -- not the fp8-compressed
     entry, which lives in `Glm5NextIndexerCache`.
     """
 
@@ -172,7 +179,7 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
             num_kv_heads=2,
             head_size=self.head_dim,
             head_size_v=0,
-            dtype=torch.bfloat16,
+            dtype=self.dtype,
             # Tiny per-request ring; every DCP rank keeps the full tail so the
             # rank owning a pool can compress it.
             dcp_sharded=False,
@@ -214,6 +221,16 @@ class Indexer(nn.Module):
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.index_kpool = config.index_kpool
         self.q_lora_rank = q_lora_rank  # 1536
+        self.fp16_queries = cast(dict[str, Any], vllm_config.additional_config).get(
+            "glm_indexer_fp16_queries", False
+        )
+        if self.fp16_queries and (
+            not current_platform.is_device_capability(75)
+            or vllm_config.model_config.dtype != torch.float16
+        ):
+            raise ValueError(
+                "glm_indexer_fp16_queries requires SM75 and --dtype float16"
+            )
 
         # kpool
         self.index_kpool_compress_ape = nn.Parameter(
@@ -222,7 +239,9 @@ class Indexer(nn.Module):
         # Keep the checkpoint name ``index_kpool_compress_gate`` without a
         # ``.weight`` suffix. F.linear consumes its [head_dim, hidden_size] shape.
         self.index_kpool_compress_gate = nn.Parameter(
-            torch.empty(self.head_dim, hidden_size, dtype=torch.bfloat16)
+            torch.empty(
+                self.head_dim, hidden_size, dtype=vllm_config.model_config.dtype
+            )
         )
 
         # no tensor parallel, just replicated
@@ -234,7 +253,7 @@ class Indexer(nn.Module):
             prefix=f"{prefix}.wq_b",
         )
         # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
-        # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
+        # FP8 wk weights are upcast to the model dtype during loading for fusion.
         self.wk_weights_proj = MergedColumnParallelLinear(
             hidden_size,
             [self.head_dim, self.n_head],
@@ -270,7 +289,7 @@ class Indexer(nn.Module):
         # so the decode side sees the prefill tail. See CircularBufferManager.
         self.tail_cache = Glm5NextTailCache(
             head_dim=self.head_dim,
-            dtype=torch.bfloat16,
+            dtype=vllm_config.model_config.dtype,
             prefix=f"{prefix}.tail_cache",
             cache_config=cache_config,
             index_kpool=self.index_kpool,
@@ -345,15 +364,19 @@ class Indexer(nn.Module):
         # nope), so skip the rope split / rotary / cat entirely; otherwise the
         # split/reshape would build 0-element tensors (breaks dynamo tracing).
 
-        # Rotate Q into the cached K basis before computing fp8 MQA logits.
+        # Rotate Q into the cached K basis before computing MQA logits.
         # Fusing the fp32 FWHT and quantization avoids an intermediate HBM
         # round-trip and bf16 matrix-rounding bias.
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        if self.fp16_queries:
+            q_index = fwht128_fp16(q)
+            q_scale = None
+        else:
+            q_index, q_scale = fwht128_quant_fp8(q)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+        q_index = q_index.view(-1, self.n_head, self.head_dim)
 
         weights = _fused_indexer_weight_scale(
             weights, q_scale, self.softmax_scale * self.n_head**-0.5
@@ -369,14 +392,14 @@ class Indexer(nn.Module):
         # checkpoint uses index_n_heads=16. Zero-pad q and the per-head
         # weights: logits are a weights-weighted sum over heads, so
         # zero-weight padded heads contribute exactly nothing.
-        if self.n_head < 32:
+        if self.n_head < 32 and not current_platform.is_device_capability(75):
             pad = 32 - self.n_head
-            q_fp8 = _pad_indexer_heads(q_fp8, pad)
+            q_index = _pad_indexer_heads(q_index, pad)
             weights = _pad_indexer_heads(weights, pad)
 
         return self.indexer_op(
             hidden_states,
-            q_fp8,
+            q_index,
             k,
             weights,
             gate_score=gate_score,

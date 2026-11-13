@@ -41,6 +41,8 @@ steps:
   - csrc/
   - tests/kernels/core
   - vllm/kernels/triton/
+  - vllm/models/glm5next/nvidia/ops/embedding12_codec.py
+  - vllm/models/glm5next/nvidia/ops/embedding_lossless_sm75.py
   - tests/kernels/test_concat_mla_q.py
   - tests/kernels/test_fused_qk_norm_rope_gate.py
   - vllm/model_executor/layers/fused_qk_norm_rope.py
@@ -65,6 +67,8 @@ steps:
       - csrc/
       - tests/kernels/core
       - vllm/kernels/triton/
+      - vllm/models/glm5next/nvidia/ops/embedding12_codec.py
+      - vllm/models/glm5next/nvidia/ops/embedding_lossless_sm75.py
       - tests/kernels/test_top_k_per_row.py
       - vllm/model_executor/layers/indexer_topk.py
       - vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
@@ -447,6 +451,7 @@ steps:
   - vllm/v1/attention
     # TODO: remove this dependency (https://github.com/vllm-project/vllm/issues/32267)
   - vllm/model_executor/layers/attention
+  - vllm/models/glm5next/
   - vllm/utils/flashinfer.py
   - tests/kernels/attention
   commands:

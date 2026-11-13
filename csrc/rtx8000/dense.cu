@@ -1,41 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "dense_gemv_kernel.cuh"
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 
 extern "C" int dense75_mma_launch(const void*, const void*, void*, int, int,
                                   int, int, void*);
 
-// Weight rows are contiguous; each warp produces a column of up to 20 tokens.
-// Keep FP32 accumulation and the original FP16 weights.
-template <int M>
-__global__ void gemv(const half* __restrict__ x, const half* __restrict__ w,
-                     half* __restrict__ y, int N, int K) {
-  const int lane = threadIdx.x & 31;
-  const int n = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-  if (n >= N) return;
-  float sums[M] = {};
-  for (int k = lane * 8; k < K; k += 256) {
-    const int4 packed_w = *reinterpret_cast<const int4*>(w + n * K + k);
-    const half* wh = reinterpret_cast<const half*>(&packed_w);
-#pragma unroll
-    for (int m = 0; m < M; ++m) {
-      const int4 packed_x = *reinterpret_cast<const int4*>(x + m * K + k);
-      const half* xh = reinterpret_cast<const half*>(&packed_x);
-#pragma unroll
-      for (int i = 0; i < 8; ++i)
-        sums[m] = fmaf(__half2float(wh[i]), __half2float(xh[i]), sums[m]);
-    }
-  }
-#pragma unroll
-  for (int m = 0; m < M; ++m) {
-#pragma unroll
-    for (int step = 16; step; step /= 2)
-      sums[m] += __shfl_down_sync(0xffffffff, sums[m], step);
-    if (!lane) y[m * N + n] = __float2half(sums[m]);
-  }
-}
+#define RTX_DENSE_GEMV_EXTRA(M)                                               \
+  extern "C" int dense75_gemv_m##M(const void*, const void*, void*, int, int, \
+                                   int, void*);
+#include "dense_gemv_extra_variants.inc"
+#undef RTX_DENSE_GEMV_EXTRA
 
 template <int BN, int BK, int WN>
 int tensor_gemm(const void* x, const void* w, void* y, int M, int N, int K,
@@ -74,6 +49,11 @@ extern "C" int dense75_launch(const void* x, const void* w, void* y, int M,
         static_cast<half*>(y), N, K);                                         \
     break
   switch (M) {
+#define RTX_DENSE_GEMV_EXTRA(m) \
+  case m:                       \
+    return dense75_gemv_m##m(x, w, y, N, K, variant, stream_ptr);
+#include "dense_gemv_extra_variants.inc"
+#undef RTX_DENSE_GEMV_EXTRA
     CASE_M(1);
     CASE_M(2);
     CASE_M(4);

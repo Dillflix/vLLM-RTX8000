@@ -1,0 +1,149 @@
+{
+  "status": "Qualified bounded 512K-input profile; not production-deployed or broadly quality-evaluated",
+  "hardware": "4x Quadro RTX8000, 200 W each; NVLink pairs 0/1 and 2/3 on separate NUMA nodes",
+  "checkpoint": "wtdcode/GLM-5.3-Flash-AWQ-W4A16",
+  "checkpoint_revision": "abd7b07719111f137e1de8a0c1b7e01c11b74d1a",
+  "qualified_triton_source": "https://github.com/Chennesxu/triton-turing",
+  "qualified_triton_revision": "8da2085caa00c79cf7ce99c7927bb72135e36af1",
+  "engine_kwargs": {
+    "model": "/models/GLM-5.3-Flash-AWQ-W4A16",
+    "tokenizer": "/models/GLM-5.3-Flash-AWQ-W4A16",
+    "tokenizer_mode": "glm5_next",
+    "revision": "abd7b07719111f137e1de8a0c1b7e01c11b74d1a",
+    "tokenizer_revision": "abd7b07719111f137e1de8a0c1b7e01c11b74d1a",
+    "trust_remote_code": false,
+    "dtype": "half",
+    "quantization": "compressed-tensors",
+    "load_format": "safetensors",
+    "safetensors_load_strategy": "lazy",
+    "tensor_parallel_size": 2,
+    "pipeline_parallel_size": 2,
+    "distributed_executor_backend": "mp",
+    "numa_bind": true,
+    "numa_bind_nodes": [
+      0,
+      0,
+      1,
+      1
+    ],
+    "numa_bind_cpus": [
+      "0-9,20-29",
+      "0-9,20-29",
+      "10-19,30-39",
+      "10-19,30-39"
+    ],
+    "max_model_len": 525312,
+    "max_num_seqs": 5,
+    "max_num_batched_tokens": 512,
+    "gpu_memory_utilization": 0.96,
+    "cpu_offload_gb": 0.0,
+    "speculative_config": {
+      "method": "mtp",
+      "model": "/models/GLM-5.3-Flash-MTP-RTN-W4A16-g128-v1",
+      "num_speculative_tokens": 2,
+      "draft_tensor_parallel_size": 2,
+      "quantization": "compressed-tensors",
+      "moe_backend": "marlin",
+      "max_model_len": 525312,
+      "use_local_argmax_reduction": true,
+      "draft_load_config": {
+        "load_format": "safetensors",
+        "safetensors_load_strategy": "lazy",
+        "model_loader_extra_config": {
+          "enable_weights_track": true
+        }
+      }
+    },
+    "enforce_eager": false,
+    "compilation_config": {
+      "mode": 0,
+      "cudagraph_mode": "PIECEWISE",
+      "prefill_cudagraph_capture_token_sizes": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "decode_cudagraph_capture_request_sizes": [],
+      "max_prefill_cudagraph_capture_tokens": 15
+    },
+    "enable_chunked_prefill": true,
+    "enable_prefix_caching": true,
+    "language_model_only": false,
+    "skip_mm_profiling": false,
+    "attention_backend": "TRITON_MLA_SPARSE_SM75",
+    "kernel_config": {
+      "moe_backend": "marlin",
+      "enable_flashinfer_autotune": false
+    },
+    "additional_config": {
+      "glm_native_dense": true,
+      "kda_prefill_backend": "triton",
+      "glm_indexer_fp16_queries": false,
+      "glm_mhc_backend": "turing",
+      "glm_sm75_prefill_fp16_keys": true,
+      "glm_sm75_prefill_h32": true,
+      "glm_sm75_dynamic_mqa": true,
+      "glm_sm75_mqa_scratch": true,
+      "glm_native_dense_mtp": false,
+      "glm_sm75_bound_gather": true,
+      "glm_sm75_stream_vision": true,
+      "glm_sm75_shard_encoder_cache": false,
+      "glm_sm75_lossless_embedding": true,
+      "glm_sm75_kda_scratch": true,
+      "glm_sm75_mla_nope_view": true,
+      "glm_sm75_mhc_post_workspace": true,
+      "glm_sm75_lossless_head": true,
+      "glm_sm75_request_gather_bound": true,
+      "glm_sm75_native_topk": true
+    },
+    "seed": 17,
+    "generation_config": "vllm",
+    "disable_log_stats": false,
+    "kv_cache_memory_bytes": 3581476864,
+    "enable_extensible_kv_cache": false,
+    "per_request_spec_decode_metrics": "detailed",
+    "mm_encoder_attn_backend": "TORCH_SDPA",
+    "mm_encoder_tp_mode": "weights",
+    "async_scheduling": true,
+    "limit_mm_per_prompt": {
+      "image": 999,
+      "video": 0
+    }
+  },
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+    "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "VLLM_PP_LAYER_PARTITION": "24,21",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "VLLM_RTX8000_MARLIN_TILES": "0",
+    "VLLM_MARLIN_MOE_EXACT_SHARED_MEM": "0",
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": "193"
+  },
+  "api_flags": {
+    "reasoning_parser": "glm47",
+    "tool_call_parser": "glm47",
+    "enable_auto_tool_choice": true
+  },
+  "limits": [
+    "Replace model paths and CPU affinity with the local installation; install the pinned Turing compiler first.",
+    "MTP is a separately converted INT4 group-128 artifact; the unquantized upstream MTP weights do not fit this profile.",
+    "512K means one 524288-token input plus 1024 output tokens, not five such requests at once.",
+    "Four native-resolution images and long text capacity were qualified separately; video is disabled.",
+    "The image-count admission ceiling of 999 is not a capacity guarantee.",
+    "The GPU guard observed no new GPU PCIe errors during qualification; long-term hardware stability is not established."
+  ]
+}

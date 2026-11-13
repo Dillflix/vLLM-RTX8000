@@ -1014,6 +1014,12 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
 class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     """MLA attention implementation with forward_mqa and forward_mha methods."""
 
+    # Opt in only when reserve_workspace() accounts for all extra transient
+    # prefill buffers instead of the common expanded-KV simulation. Default
+    # preserves existing profiling for every other backend, including those
+    # without a dense-MHA path; they can qualify their own bound separately.
+    profiles_prefill_workspace: ClassVar[bool] = False
+
     supports_pcp: bool = True
 
     def get_fp8_ds_mla_row_bytes(self) -> int:
